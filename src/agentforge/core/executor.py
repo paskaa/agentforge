@@ -321,10 +321,31 @@ class EnhancedExecutor:
         if reply:
             chat_id = task.get("chat_id", "")
             sender_id = task.get("sender_id", "")
-            if chat_id == self.group_chat_id:
-                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}", target_id=self.group_chat_id, id_type="chat_id")
+            is_dm = task.get("is_dm", "false") == "true"
+            source = task.get("source", "")
+
+            # DM 消息 -> 回复给发送者私聊
+            if is_dm:
+                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
+                                 target_id=sender_id, id_type="open_id")
+                print(f"[{self.agent_id}] Reply via DM to: {sender_id}")
+            # 群聊消息 -> 回复到大群
+            elif chat_id == self.group_chat_id:
+                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
+                                 target_id=self.group_chat_id, id_type="chat_id")
+                print(f"[{self.agent_id}] Reply to GROUP")
+            # 工作流/系统任务 -> 回复到大群（除非指定了 reply_to）
+            elif source in ("workflow-engine", "self_boot_check", "pipeline_fix_done", "pipeline_test_done"):
+                reply_target = task.get("reply_to", self.group_chat_id)
+                reply_type = task.get("reply_type", "chat_id")
+                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
+                                 target_id=reply_target, id_type=reply_type)
+                print(f"[{self.agent_id}] Reply to {reply_type}:{reply_target}")
             else:
-                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}", target_id=sender_id, id_type="open_id")
+                # 兜底：回复到大群
+                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
+                                 target_id=self.group_chat_id, id_type="chat_id")
+                print(f"[{self.agent_id}] Reply to GROUP (fallback)")
 
     def boot_check(self):
         rc, out, _ = self._run_script("zentao-my-bugs.sh", self.agent_id, "active", timeout=60)
