@@ -1,0 +1,2 @@
+[console_scripts]
+agentforge = agentforge.cli:main
