@@ -66,7 +66,7 @@ class Config:
             return json.load(f)
 
     def load_agent_soul(self, agent_id):
-        soul_path = self.agents_config_dir / agent_id / "SOUL.md"
+        soul_path = self.agents_config_dir / agent_id / "agent" / "SOUL.md"
         with open(soul_path) as f:
             return f.read()
 
@@ -87,7 +87,7 @@ class Config:
         }
 
     def get_agent_experience_path(self, agent_id):
-        return str(self.agents_config_dir / agent_id / ".experience.json")
+        return str(self.agents_config_dir / agent_id / "agent" / ".experience.json")
 
     def get_agent_dynamic_rules_path(self, agent_id):
-        return str(self.agents_config_dir / agent_id / ".dynamic_rules.md")
+        return str(self.agents_config_dir / agent_id / "agent" / ".dynamic_rules.md")

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import requests
+from pathlib import Path
 from datetime import datetime
 
 
@@ -20,12 +21,13 @@ class SelfOptimizer:
         from agentforge.core.memory import ExperienceMemory
         if config:
             self.memory = ExperienceMemory(agent_id, config)
-            self.soul_path = config.agents_config_dir / agent_id / "SOUL.md"
-            self.dynamic_rules_file = config.get_agent_dynamic_rules_path(agent_id)
+            self.soul_path = config.agents_config_dir / agent_id / "agent" / "SOUL.md"
+            self.dynamic_rules_file = str(config.agents_config_dir / agent_id / "agent" / ".dynamic_rules.md")
         else:
             self.memory = ExperienceMemory(agent_id)
-            self.soul_path = f"./config/agents/{agent_id}/SOUL.md"
-            self.dynamic_rules_file = f"./config/agents/{agent_id}/.dynamic_rules.md"
+            base = os.environ.get("AGENTS_CONFIG_DIR", "./config/agents")
+            self.soul_path = Path(base) / agent_id / "agent" / "SOUL.md"
+            self.dynamic_rules_file = str(Path(base) / agent_id / "agent" / ".dynamic_rules.md")
 
     def reflect_on_task(self, task_desc, tool_output, llm_response, time_taken):
         task_type = self._classify(task_desc)

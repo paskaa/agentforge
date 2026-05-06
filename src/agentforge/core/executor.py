@@ -75,7 +75,7 @@ class EnhancedExecutor:
         print(f"[{agent_id}] Started as {self.agent_name}")
 
     def _load_config(self):
-        soul_path = self.agents_config_dir / self.agent_id / "SOUL.md"
+        soul_path = self.agents_config_dir / self.agent_id / "agent" / "SOUL.md"
         with open(soul_path) as f:
             self.system_prompt = f.read()
         with open(self.creds_file) as f:

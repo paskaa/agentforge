@@ -16,7 +16,8 @@ class ExperienceMemory:
         if config:
             self.exp_file = config.get_agent_experience_path(agent_id)
         else:
-            self.exp_file = f"./config/agents/{agent_id}/.experience.json"
+            base = os.environ.get("AGENTS_CONFIG_DIR", "./config/agents")
+            self.exp_file = f"{base}/{agent_id}/agent/.experience.json"
         self.data = self._load()
 
     def _load(self):
