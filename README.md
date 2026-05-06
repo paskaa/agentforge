@@ -1,0 +1,187 @@
+# AgentForge
+
+> Multi-agent collaboration framework with Feishu integration, tool execution, autonomous optimization, and workflow orchestration.
+
+AgentForge deploys multiple AI agents (each with a distinct role) that collaborate through a Redis message queue to handle real-world tasks — bug tracking, code management, project reporting, and more. Each agent connects to Feishu (Lark) for human interaction, calls LLM APIs for reasoning, and executes external scripts for real-world actions.
+
+## Architecture
+
+```
+┌─────────────── Feishu (Lark) ───────────────┐
+│         Group Chat / Direct Messages         │
+└───────────────┬─────────────────────────────┘
+                │ WebSocket (per-agent)
+                ▼
+┌─── src/agentforge/network/ws_listener.py ───┐
+│  Parse @mention + keyword routing            │
+└───────────────┬─────────────────────────────┘
+                │ Redis Stream (agent-work-queue)
+                ▼
+┌─── src/agentforge/core/executor.py ─────────┐
+│  ┌──────────┐ ┌───────────┐ ┌────────────┐  │
+│  │ Intent    │ │ Tool      │ │ LLM        │  │
+│  │ Routing   │ │ Execution │ │ (multi-    │  │
+│  │           │ │ (scripts) │ │  model)    │  │
+│  └──────────┘ └───────────┘ └────────────┘  │
+│  ┌────────────────────────────────────────┐  │
+│  │  Self-Optimizer + Experience Memory     │  │
+│  └────────────────────────────────────────┘  │
+└───────────────┬─────────────────────────────┘
+                │
+     ┌──────────┼──────────┐
+     ▼          ▼          ▼
+  Feishu    Redis Stream  External Scripts
+  Reply     (cross-agent) (zentao, git)
+```
+
+## Features
+
+- **Multi-Agent Roles** — 8 preset personas with independent SOUL.md definitions
+- **Anti-Hallucination** — Tool results marked `__RAW__` bypass the LLM entirely
+- **Model Routing** — Auto-selects best model per task type (coding / analysis / simple)
+- **Autonomous Pipeline** — Boot self-check → bug query → git commit → push → handoff to QA → close
+- **Self-Optimization** — Post-task reflection, experience memory, dynamic rule updates
+- **Intent-Based Routing** — Keyword scoring determines which agent responds
+- **Workflow Engine** — Serial, parallel, and approval-gated multi-step workflows
+- **Skill Registry** — Discoverable, installable skills with keyword matching
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- Redis
+- Feishu (Lark) open platform apps
+- Dashscope / Bailian API (or any OpenAI-compatible API)
+
+### Setup
+
+```bash
+git clone https://github.com/paskaa/agentforge.git
+cd agentforge
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env   # edit with your values
+cp config/feishu_credentials.json.example config/feishu_credentials.json
+```
+
+### Run
+
+```bash
+# Agent executor
+python3 -m agentforge executor --agent xunyu
+
+# WebSocket listener
+python3 -m agentforge ws-listener --agent xunyu
+
+# Scheduler (daily reports + health checks)
+python3 -m agentforge scheduler
+
+# Workflow engine
+python3 -m agentforge workflow list
+python3 -m agentforge workflow create
+
+# Skills
+python3 -m agentforge skills list
+python3 -m agentforge skills find "查询 bug"
+```
+
+### Systemd Deployment
+
+```bash
+sudo cp deploy/systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentforge-executor@xunyu
+sudo systemctl enable --now agentforge-ws@xunyu
+sudo systemctl enable --now agentforge-scheduler
+```
+
+## Directory Structure
+
+```
+agentforge/
+├── src/agentforge/             # Python package
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── cli.py                  # CLI entry point
+│   ├── config.py               # Configuration loader (auto-loads .env)
+│   ├── core/                   # Core modules
+│   │   ├── executor.py         # Main agent executor
+│   │   ├── optimizer.py        # Self-optimization & reflection
+│   │   └── memory.py           # Experience memory
+│   ├── network/                # Network / messaging
+│   │   ├── feishu.py           # Feishu API wrapper
+│   │   └── ws_listener.py      # WebSocket listener
+│   ├── tools/                  # Tools & utilities
+│   │   ├── skill_registry.py   # Skill discovery & install
+│   │   └── scheduler.py        # Cron-style scheduler
+│   └── workflow/               # Workflow orchestration
+│       └── engine.py           # Multi-step workflow engine
+├── config/
+│   ├── agents/                 # Per-agent SOUL.md + experience
+│   │   └── example/
+│   │       └── SOUL.md.example
+│   ├── gateway/                # Per-agent LLM gateway config (optional)
+│   └── feishu_credentials.json.example
+├── scripts/                    # External tool scripts (zentao, git, etc.)
+├── skills/
+│   ├── builtin/                # Built-in skills
+│   ├── community/              # Community skills
+│   └── custom/                 # Custom installed skills
+├── deploy/
+│   └── systemd/                # systemd service templates
+├── .env                        # Real config (git-ignored)
+├── .env.example                # Template (committed)
+├── .gitignore
+├── pyproject.toml
+├── requirements.txt
+├── LICENSE
+└── README.md
+```
+
+## Agent Roles
+
+| ID | Name | Role | Expertise |
+|---|---|---|---|
+| `zhugeliang` | 诸葛亮 | Architect | Architecture, code review, standards |
+| `liubei` | 刘备 | PM | Summary, progress, management |
+| `guanyu` | 关羽 | Backend | Java, API, Spring, services |
+| `zhaoyun` | 赵云 | Frontend | Vue, React, UI, components |
+| `xunyu` | 荀彧 | DBA | SQL, database, performance |
+| `zhangfei` | 张飞 | QA | Testing, bugs, zen-tao, regression |
+| `huatuo` | 华佗 | Product | Requirements, UX, PRD |
+| `chenlin` | 陈琳 | Tech Writer | Docs, wiki, release notes |
+
+## Configuration
+
+All sensitive info lives in `.env` and `config/feishu_credentials.json` — **neither is committed to git**.
+
+### `.env`
+
+```env
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+FEISHU_GROUP_CHAT_ID=oc_xxxx
+FEISHU_CREDENTIALS_FILE=./config/feishu_credentials.json
+BAILIAN_API_KEY=sk-xxx
+BAILIAN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+BAILIAN_DEFAULT_MODEL=qwen-plus
+MODEL_CODING=qwen-coder-plus
+MODEL_ANALYSIS=qwen-plus
+MODEL_SIMPLE=qwen-turbo
+SCRIPTS_DIR=./scripts
+AGENTS_CONFIG_DIR=./config/agents
+```
+
+### `config/agents/{id}/SOUL.md`
+
+Each agent needs a SOUL.md with role definition and anti-hallucination rules. See `config/agents/example/SOUL.md.example`.
+
+### `config/gateway/{id}.json` (optional)
+
+Per-agent LLM gateway config. If present, overrides `.env` API key/base URL for that agent.
+
+## License
+
+Apache-2.0

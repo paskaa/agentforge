@@ -1,0 +1,23 @@
+# Byte-compiled
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Sensitive config
+.env
+config/feishu_credentials.json
+config/gateway/*.json
+config/agents/*/SOUL.md
+config/agents/*/.experience.json
+config/agents/*/.dynamic_rules.md

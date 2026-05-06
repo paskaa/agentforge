@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentforge"
+version = "1.0.0"
+description = "Multi-agent collaboration framework with Feishu integration, tool execution, and autonomous optimization"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = [
+    "redis>=5.0",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "lark-oapi>=1.4",
+]
+
+[project.scripts]
+agentforge = "agentforge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
