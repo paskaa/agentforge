@@ -167,10 +167,8 @@ class EnhancedExecutor:
                         results.append(f"【Bug #{bid} 详情】\n{out}")
                         results.append("【指令】请根据上述详情，分析原因并给出修复方案。")
                 elif "解决" in message or "resolve" in message.lower() or "关闭" in message.lower():
-                    action = "resolve" if ("解决" in message or "resolve" in message.lower()) else "close"
-                    rc, out, _ = self._run_script("zentao-write-bug.sh", action, bid, "智能体已处理", timeout=30)
-                    if out:
-                        results.append(out)
+                    # 智能体不能关闭 Bug，只有人类发起人才能关闭
+                    results.append(f"⚠️ 权限不足：智能体无权关闭 Bug #{bid}。请人类发起人手动操作。")
 
         # My bugs / progress
         if any(kw in message for kw in ["我的任务", "进度", "汇报"]) or "my bugs" in message.lower() or "my tasks" in message.lower():
@@ -280,13 +278,12 @@ class EnhancedExecutor:
                 })
                 self.ack(task["msg_id"]); return
 
-        # Pipeline: verify (Huatuo)
+        # Pipeline: verify (Huatuo) - 智能体不能关闭 Bug，只报告验收结果
         if source == "pipeline_test_done" and self.agent_id == "huatuo":
             bm = re.search(r"#(\d{2,4})", message)
             if bm:
                 bid = bm.group(1)
-                self._run_script("zentao-write-bug.sh", "close", bid, "产品验收通过", timeout=30)
-                self.send_feishu(f"**验收完成**\n\nBug #{bid} 已关闭，全流程终结。")
+                self.send_feishu(f"**验收通过**\n\nBug #{bid} 功能验证完成。\n\n⚠️ 请人类发起人手动关闭该 Bug（智能体无权关闭）。")
                 self.ack(task["msg_id"]); return
 
         # Autonomous fix (self-boot)
@@ -304,8 +301,7 @@ class EnhancedExecutor:
                 rc2, out2, _ = self._run_script("git-ops.sh", "commit", f"Fix #{bid}: {title}", timeout=30)
                 self._run_script("git-ops.sh", "push", timeout=30)
                 if rc2 == 0 or "没有需要提交的变更" in out2:
-                    self._run_script("zentao-write-bug.sh", "resolve", bid, "Agent 自动修复", timeout=30)
-                    self.send_feishu(f"**修复完成**\n\nBug #{bid} 已推送，流转给张飞测试...")
+                    self.send_feishu(f"**代码已推送**\n\nBug #{bid} 修复完成，等待人类确认并关闭。\n\n流转给张飞测试...")
                     self.redis.xadd("agent-work-queue", {
                         "agent_id": "zhangfei", "message": f"请测试 Bug #{bid} 的修复情况。",
                         "source": "pipeline_fix_done", "sender_id": self.agent_id,
