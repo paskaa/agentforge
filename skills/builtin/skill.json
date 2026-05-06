@@ -1,0 +1,11 @@
+{
+  "id": "feishu-notify",
+  "name": "飞书消息通知",
+  "description": "向飞书群发送消息通知",
+  "type": "agentforge",
+  "version": "1.0.0",
+  "entry_point": "python3 /root/.openclaw/extensions/feishu-notify/send.py",
+  "triggers": ["通知", "发送", "报告"],
+  "keywords": ["飞书", "通知", "消息", "报告"],
+  "category": "builtin"
+}

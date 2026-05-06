@@ -1,0 +1,10 @@
+{
+  "id": "zentao-query",
+  "name": "禅道 Bug 查询",
+  "description": "查询禅道 Bug 详情",
+  "type": "agentforge",
+  "version": "1.0.0",
+  "entry_point": "zentao-bug-query.sh",
+  "triggers": ["查询 bug", "bug 详情", "bug 状态"],
+  "keywords": ["bug", "禅道", "缺陷", "查询"]
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentForge WS Listener Instance - %i
+After=redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agentforge
+ExecStart=/opt/agentforge/venv/bin/python3 -m agentforge.ws_listener_instance --agent %i
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/agentforge/.env
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentforge-ws-%i
+
+[Install]
+WantedBy=multi-user.target

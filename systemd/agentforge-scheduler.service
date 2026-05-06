@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentForge Scheduler
+After=redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agentforge
+ExecStart=/opt/agentforge/venv/bin/python3 -m agentforge.scheduler
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/agentforge/.env
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentforge-scheduler
+
+[Install]
+WantedBy=multi-user.target

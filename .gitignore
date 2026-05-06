@@ -1,0 +1,29 @@
+# Byte-compiled / optimized
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AgentForge runtime
+*.log
+agent-sessions/
+
+# Sensitive config (keep .example files)
+config/feishu_credentials.json
+config/gateway/
+config/agents/*/SOUL.md
+config/agents/*/.experience.json
+config/agents/*/.dynamic_rules.md
