@@ -11,6 +11,17 @@ import json
 import os
 from pathlib import Path
 
+# Auto-load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    # Try project root .env first, then current directory
+    for env_path in [Path(__file__).parent.parent / ".env", Path(".") / ".env"]:
+        if env_path.exists():
+            load_dotenv(env_path)
+            break
+except ImportError:
+    pass
+
 
 class Config:
     """Global configuration loader"""
