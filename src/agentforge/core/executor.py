@@ -347,6 +347,9 @@ class EnhancedExecutor:
                                  target_id=self.group_chat_id, id_type="chat_id")
                 print(f"[{self.agent_id}] Reply to GROUP (fallback)")
 
+        # ACK
+        self.ack(task["msg_id"])
+
     def boot_check(self):
         rc, out, _ = self._run_script("zentao-my-bugs.sh", self.agent_id, "active", timeout=60)
         if rc != 0 or not out:
@@ -382,7 +385,7 @@ class EnhancedExecutor:
                     groupname=f"{self.agent_id}-workers",
                     consumername=f"{self.agent_id}-worker",
                     streams={"agent-work-queue": "0"}, count=1, block=0)
-                if not result:
+                if not result or not result[0][1]:
                     result = self.redis.xreadgroup(
                         groupname=f"{self.agent_id}-workers",
                         consumername=f"{self.agent_id}-worker",
