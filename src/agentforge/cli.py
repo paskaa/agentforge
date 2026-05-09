@@ -9,6 +9,7 @@ Usage:
     agentforge skills [list|stats|find <task>]
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -16,7 +17,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _setup_logging(level: str = "INFO"):
+    """Configure structured logging for all agentforge modules."""
+    fmt = "%(asctime)s [%(levelname)-5s] %(name)s — %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format=fmt,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,
+    )
+    # Quiet down noisy third-party loggers
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+
+
 def main():
+    _setup_logging()
     if len(sys.argv) < 2:
         print("AgentForge - Multi-Agent Collaboration Framework")
         print("\nUsage:")
@@ -30,24 +46,31 @@ def main():
     cmd = sys.argv[1]
 
     if cmd == "executor":
-        from agentforge.core.executor import EnhancedExecutor
+        from agentforge.config import Config
+        from agentforge.core.executor import AgentExecutor
+
+        agent_id = None
         for i, a in enumerate(sys.argv[2:]):
-            if a == "--agent" and i + 2 < len(sys.argv) - 1:
+            if a == "--agent" and i + 1 < len(sys.argv) - 1:
                 agent_id = sys.argv[i + 3]
                 break
-        else:
-            print("Error: --agent <id> required"); sys.exit(1)
-        EnhancedExecutor(agent_id).run()
+        if not agent_id:
+            print("Error: --agent <id> required")
+            sys.exit(1)
+
+        cfg = Config()
+        AgentExecutor(agent_id, config=cfg).run()
 
     elif cmd == "ws-listener":
-        # Delegate to the ws_listener module which handles its own args
-        sys.argv = [sys.argv[0], "network", "ws_listener"] + sys.argv[2:]
         from agentforge.network import ws_listener as ws_mod
+        sys.argv = [sys.argv[0], "network", "ws_listener"] + sys.argv[2:]
         ws_mod.main()
 
     elif cmd == "scheduler":
+        from agentforge.config import Config
         from agentforge.tools.scheduler import Scheduler
-        Scheduler().loop()
+        cfg = Config()
+        Scheduler(config=cfg).loop()
 
     elif cmd == "workflow":
         from agentforge.workflow.engine import WorkflowEngine
@@ -80,7 +103,8 @@ def main():
             print("Usage: agentforge skills [list|stats|find <task>]")
 
     else:
-        print(f"Unknown command: {cmd}"); sys.exit(1)
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

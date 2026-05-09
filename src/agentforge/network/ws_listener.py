@@ -1,8 +1,10 @@
 """
-WebSocket Listener - Receives Feishu messages, routes to agents via Redis Stream.
+WebSocket Listener — Receives Feishu messages, routes to agents via Redis Stream.
 
 Per-agent instance. Each agent runs its own listener.
-Start: python3 -m agentforge network.ws-listener --agent xunyu
+Start: python3 -m agentforge ws-listener --agent xunyu
+
+Uses a persistent Redis connection instead of creating one per message.
 """
 
 import sys
@@ -14,24 +16,37 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 from lark_oapi.ws import *
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_STREAM = "agent-work-queue"
-CREDENTIALS_FILE = os.environ.get("FEISHU_CREDENTIALS_FILE", "./config/feishu_credentials.json")
+from agentforge.config import Config
 
+# --- Bootstrap ---
 AGENT_ID = None
 for i, arg in enumerate(sys.argv):
     if arg == "--agent" and i + 1 < len(sys.argv):
         AGENT_ID = sys.argv[i + 1]
         break
 if not AGENT_ID:
-    print("Usage: python3 -m agentforge network.ws-listener --agent <id>")
+    # Also try from env
+    AGENT_ID = os.environ.get("AGENTFORGE_AGENT_ID", "")
+if not AGENT_ID:
+    print("Usage: python3 -m agentforge ws-listener --agent <id>")
     sys.exit(1)
 
-AGENT_NAMES = {
-    "zhugeliang": "诸葛亮", "liubei": "刘备", "guanyu": "关羽", "zhaoyun": "赵云",
-    "xunyu": "荀彧", "zhangfei": "张飞", "huatuo": "华佗", "chenlin": "陈琳",
-}
+cfg = Config()
+REDIS_HOST = cfg.redis_host
+REDIS_PORT = cfg.redis_port
+REDIS_STREAM = cfg.redis_stream
+CREDENTIALS_FILE = str(cfg.feishu_credentials_file)
+AGENT_NAMES = cfg.agent_names
+
+# Persistent Redis connection — created once, reused for all messages
+_redis_conn: redis.Redis | None = None
+
+
+def _get_redis() -> redis.Redis:
+    global _redis_conn
+    if _redis_conn is None:
+        _redis_conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    return _redis_conn
 
 
 def handle_message(ctx):
@@ -46,7 +61,7 @@ def handle_message(ctx):
 
         chat_id = getattr(msg_obj, "chat_id", "unknown")
         chat_type = getattr(msg_obj, "chat_type", "unknown")
-        print(f"[WS:{AGENT_ID}] {text[:15]}... | {chat_type} | {chat_id}")
+        print(f"[WS:{AGENT_ID}] {text[:20]}... | {chat_type} | {chat_id}")
 
         is_dm = chat_type == "p2p"
         target = AGENT_ID if is_dm else None
@@ -57,7 +72,7 @@ def handle_message(ctx):
                 target = AGENT_ID
 
         if target == AGENT_ID:
-            r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+            r = _get_redis()
             r.xadd(REDIS_STREAM, {
                 "agent_id": AGENT_ID, "message": text, "source": "ws_listener",
                 "sender_id": ctx.event.sender.sender_id.open_id,

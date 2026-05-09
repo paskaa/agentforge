@@ -1,408 +1,462 @@
 """
-Enhanced Executor - Core agent execution engine.
+Agent Executor — Core agent execution engine.
 
-Start: python3 -m agentforge core.executor --agent xunyu
+Runs as a long-lived process: polls Redis Stream for tasks,
+executes tools (via plugin registry), calls LLM, sends Feishu replies.
+
+Architecture (v2):
+  - Tool dispatch → ToolRegistry (core/tool_registry.py + builtin_tools.py)
+  - Pipeline handlers → core/pipeline.py
+  - LLM calls → core/llm.py (LLMClient with retry)
+  - Feishu I/O → network/feishu.py (requests)
+  - Config → config.py (dataclass, single source of truth)
 """
 
-import argparse
-import json
+import logging
 import os
 import re
-import redis
-import subprocess
-import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
+from typing import Optional
+
+import redis
+
+from agentforge.config import Config
+from agentforge.core.tool_registry import ToolRegistry, ToolContext, discover_tools
+from agentforge.core.tool_executor import run_script
+from agentforge.core.llm import LLMClient, SessionManager
+from agentforge.core.pipeline import (
+    PipelineContext,
+    handle_pipeline_test,
+    handle_pipeline_verify,
+    handle_self_boot,
+    handle_pm_analyze,
+)
+from agentforge.core.subagent import SubAgentPool, SubAgentContext
+from agentforge.core.coordinator import Coordinator
+from agentforge.core.trace_store import traces
+from agentforge.network.feishu import FeishuClient
+
+logger = logging.getLogger("agentforge.executor")
 
 
-class EnhancedExecutor:
-    EXPERTISE = {
-        "zhugeliang": ["架构", "设计", "方案", "review", "技术评审", "重构", "规范", "标准", "api设计"],
-        "liubei": ["汇总", "项目", "进度", "管理", "分配", "协调", "报告", "统计", "概览", "项目经理", "所有"],
-        "guanyu": ["后端", "java", "api", "接口", "服务", "数据库操作", "spring", "service", "controller", "mapper"],
-        "zhaoyun": ["前端", "vue", "react", "页面", "样式", "css", "组件", "表单", "按钮", "ui", "交互"],
-        "xunyu": ["数据库", "sql", "表", "查询", "索引", "性能", "慢查询", "优化", "数据", "mysql", "备份"],
-        "zhangfei": ["测试", "bug", "缺陷", "验证", "复现", "禅道", "用例", "回归", "验收", "qa"],
-        "huatuo": ["产品", "需求", "功能", "用户", "体验", "prd", "业务流程", "临床", "his", "门诊", "住院"],
-        "chenlin": ["文档", "说明", "手册", "wiki", "知识库", "培训", "发布", "变更", "公告"],
-    }
-    AGENT_NAMES = {
-        "zhugeliang": "诸葛亮", "liubei": "刘备", "guanyu": "关羽", "zhaoyun": "赵云",
-        "xunyu": "荀彧", "zhangfei": "张飞", "huatuo": "华佗", "chenlin": "陈琳",
-    }
+class AgentExecutor:
+    """Single agent instance — polls Redis, handles tasks, replies via Feishu."""
 
-    def __init__(self, agent_id):
+    def __init__(self, agent_id: str, config: Optional[Config] = None):
         self.agent_id = agent_id
-        self.agent_name = self.AGENT_NAMES.get(agent_id, agent_id)
+        self.cfg = config or Config()
+        self.agent_name = self.cfg.get_agent_name(agent_id)
 
-        # Redis
-        self.redis = redis.Redis(
-            host=os.environ.get("REDIS_HOST", "127.0.0.1"),
-            port=int(os.environ.get("REDIS_PORT", "6379")),
-            decode_responses=True,
+        # --- Redis ---
+        self.redis = redis.Redis(**self.cfg.redis_kwargs)
+
+        # --- LLM ---
+        llm_cfg = self.cfg.get_llm_config(agent_id)
+        self.llm = LLMClient(
+            api_key=llm_cfg["api_key"],
+            api_base=llm_cfg["api_base"],
+            model=llm_cfg["model"],
         )
-
-        # Config paths
-        self.creds_file = os.environ.get("FEISHU_CREDENTIALS_FILE", "./config/feishu_credentials.json")
-        self.group_chat_id = os.environ.get("FEISHU_GROUP_CHAT_ID", "")
-        self.scripts_dir = Path(os.environ.get("SCRIPTS_DIR", "./scripts"))
-        self.agents_config_dir = Path(os.environ.get("AGENTS_CONFIG_DIR", "./config/agents"))
-
-        # Load agent soul + gateway
-        self._load_config()
-
-        # Session dir
-        self.session_dir = f"/tmp/agentforge-sessions/{agent_id}"
-        os.makedirs(self.session_dir, exist_ok=True)
-
-        # Self-optimizer
-        from agentforge.core.optimizer import SelfOptimizer
-        self.optimizer = SelfOptimizer(
-            agent_id=agent_id, api_key=self.api_key,
-            api_base=self.api_base, model=self.model,
-        )
-
-        # Model routing
-        self.model_routes = {
-            "coding": os.environ.get("MODEL_CODING", "qwen-coder-plus"),
-            "analysis": os.environ.get("MODEL_ANALYSIS", "qwen-plus"),
-            "simple": os.environ.get("MODEL_SIMPLE", "qwen-turbo"),
-            "default": self.model,
+        self.llm.model_routes = {
+            "coding": self.cfg.model_routing.get("coding", "qwen-coder-plus"),
+            "analysis": self.cfg.model_routing.get("analysis", "qwen-plus"),
+            "simple": self.cfg.model_routing.get("simple", "qwen-turbo"),
+            "default": llm_cfg["model"],
         }
-        print(f"[{agent_id}] Started as {self.agent_name}")
 
-    def _load_config(self):
-        soul_path = self.agents_config_dir / self.agent_id / "agent" / "SOUL.md"
-        with open(soul_path) as f:
-            self.system_prompt = f.read()
-        with open(self.creds_file) as f:
-            self.feishu_app = json.load(f)["agents"][self.agent_id]
-        # Gateway (per-agent LLM config)
-        gw_path = Path(f"./config/gateway/{self.agent_id}.json")
-        if gw_path.exists():
-            with open(gw_path) as f:
-                gw = json.load(f)
-            providers = gw.get("models", {}).get("providers", {})
-            bailian = providers.get("bailian", {})
-            self.api_key = bailian.get("apiKey", os.environ.get("BAILIAN_API_KEY", ""))
-            self.api_base = bailian.get("baseUrl", os.environ.get("BAILIAN_BASE_URL", ""))
-        else:
-            self.api_key = os.environ.get("BAILIAN_API_KEY", "")
-            self.api_base = os.environ.get("BAILIAN_BASE_URL", "")
-        self.model = os.environ.get("BAILIAN_DEFAULT_MODEL", "qwen-plus")
+        # --- Feishu ---
+        self.feishu_app = self.cfg.get_feishu_app(agent_id)
+        self.feishu = FeishuClient(
+            app_id=self.feishu_app.get("appId", ""),
+            app_secret=self.feishu_app.get("appSecret", ""),
+            group_chat_id=self.cfg.feishu_group_chat_id,
+        )
+        self.group_chat_id = self.cfg.feishu_group_chat_id
 
-    def _run_script(self, name, *args, timeout=30):
-        """Run an external script, return (returncode, stdout)"""
-        script = self.scripts_dir / name
-        if not script.exists():
-            return -1, f"Script not found: {name}"
-        try:
-            r = subprocess.run(["bash", str(script)] + list(args),
-                               capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout.strip(), r.stderr.strip()
-        except subprocess.TimeoutExpired:
-            return -1, "", "timeout"
-        except Exception as e:
-            return -1, "", str(e)
+        # --- Tool Registry ---
+        self.tool_registry = ToolRegistry()
+        import agentforge.core.builtin_tools as builtin
+        discover_tools(self.tool_registry, builtin)
+        logger.info("[%s] Loaded %d tool plugins", agent_id, len(self.tool_registry._tools))
 
-    def execute_tools(self, message):
-        """Execute matching tools, return (raw_flag, output)"""
-        results = []
+        # --- Tool Context ---
+        self.tool_ctx = ToolContext(
+            agent_id=agent_id,
+            agent_name=self.agent_name,
+            zentao_dir=self.cfg.zentao_scripts_dir,
+            scripts_dir=self.cfg.scripts_dir,
+            agent_account=self.cfg.get_agent_account(agent_id),
+            refresh_token=self._refresh_token,
+        )
 
-        # Auto-refresh zentao token
-        self._run_script("zentao-token-refresh.sh", "zhangfei", timeout=10)
+        # --- Pipeline Context ---
+        self.pctx = PipelineContext(
+            agent_id=agent_id,
+            agent_name=self.agent_name,
+            zentao_dir=self.cfg.zentao_scripts_dir,
+            redis=self.redis,
+            redis_stream=self.cfg.redis_stream,
+            reply_fn=self.reply_feishu,
+            refresh_fn=self._refresh_token,
+        )
 
-        # Bug queries
-        bug_matches = re.findall(r"#?(\d{2,4})", message)
-        for bid in bug_matches:
-            rc, out, err = self._run_script("zentao-bug-query.sh", bid, timeout=15)
-            if rc == 0 and out:
-                results.append(f"【禅道查询结果】Bug #{bid}\n{out}")
-            else:
-                results.append(f"【查询结果】Bug #{bid} 不存在")
+        # --- Sessions ---
+        self.sessions = SessionManager(self.cfg.get_session_dir(agent_id))
 
-        # Liubei triage
-        if ("组织" in message and "会议" in message) or "分配" in message or "分派" in message or "制定方案" in message:
-            if self.agent_id == "liubei":
-                rc, out, _ = self._run_script("liubei_triage.sh", timeout=60)
-                if out:
-                    return ("__RAW__", out)
+        # --- Self-optimizer ---
+        from agentforge.core.optimizer import SelfOptimizer
+        self.optimizer = SelfOptimizer(agent_id=agent_id, config=self.cfg)
 
-        # Zentao summary
-        is_triage = ("组织" in message and "会议" in message) or "分配" in message or "分派" in message or "制定方案" in message
-        if not is_triage:
-            if (("汇总" in message or "所有" in message or "未解决" in message or "汇报进度" in message or "修复进度" in message or "整体情况" in message)
-                    and "bug" in message.lower()):
-                rc, out, _ = self._run_script("zentao-all-bugs.sh", "50", timeout=30)
-                if out:
-                    return ("__RAW__", out)
-                results.append("禅道汇总查询失败")
+        # --- LLM Fixer (direct fix via qwen3-coder-plus, bypasses Claude Code) ---
+        from agentforge.core.llm_fixer import LLMFixer
+        self.llm_fixer = LLMFixer(self.llm)
 
-        # Git ops
-        if "git status" in message or "代码状态" in message:
-            rc, out, _ = self._run_script("git-ops.sh", "status", timeout=10)
-            if out:
-                results.append(out)
-        if "git commit" in message or "提交代码" in message or "commit" in message.lower():
-            msg = message.split("message:")[-1].strip() if "message:" in message else "智能体修复"
-            rc, out, _ = self._run_script("git-ops.sh", "commit", msg, timeout=30)
-            if out:
-                results.append(out)
-        if "git push" in message or "推送代码" in message or "push" in message.lower():
-            rc, out, _ = self._run_script("git-ops.sh", "push", timeout=30)
-            if out:
-                results.append(out)
+        # --- SubAgent Pool (parallel bug fixing) ---
+        max_subs = int(os.environ.get("SUBAGENT_MAX", "3").split("#")[0].strip())
+        self.subpool = SubAgentPool(max_workers=max_subs)
+        self.subctx = SubAgentContext(
+            agent_id=agent_id,
+            agent_name=self.agent_name,
+            zentao_dir=self.cfg.zentao_scripts_dir,
+            redis=self.redis,
+            redis_stream=self.cfg.redis_stream,
+            reply_fn=self.reply_feishu,
+            refresh_fn=self._refresh_token,
+            zentao_write_bug=self._zentao_write_bug,
+            llm_fixer=self.llm_fixer,
+        )
 
-        # Bug fix commands
-        if any(kw in message.lower() for kw in ["修复 bug", "解决 bug", "resolve bug", "关闭 bug"]):
-            bug_match = re.search(r"#?(\d+)", message)
-            if bug_match:
-                bid = bug_match.group(1)
-                if "修复" in message:
-                    rc, out, _ = self._run_script("zentao-bug-query.sh", bid, timeout=15)
-                    if out:
-                        results.append(f"【Bug #{bid} 详情】\n{out}")
-                        results.append("【指令】请根据上述详情，分析原因并给出修复方案。")
-                elif "解决" in message or "resolve" in message.lower() or "关闭" in message.lower():
-                    # 智能体不能关闭 Bug，只有人类发起人才能关闭
-                    results.append(f"⚠️ 权限不足：智能体无权关闭 Bug #{bid}。请人类发起人手动操作。")
+        # --- Coordinator (only zhugeliang runs cross-agent scans) ---
+        self.coordinator = None
+        if agent_id == "zhugeliang":
+            self.coordinator = Coordinator(
+                zentao_dir=self.cfg.zentao_scripts_dir,
+                agent_accounts=self.cfg.agent_accounts,
+                redis=self.redis,
+                redis_stream=self.cfg.redis_stream,
+                reply_fn=self.reply_feishu,
+            )
+            logger.info("[%s] Coordinator enabled", agent_id)
 
-        # My bugs / progress
-        if any(kw in message for kw in ["我的任务", "进度", "汇报"]) or "my bugs" in message.lower() or "my tasks" in message.lower():
-            account = self.agent_id
-            rc, out, _ = self._run_script("zentao-my-bugs.sh", account, "active", timeout=30)
-            if out:
-                return ("__RAW__", out)
-            results.append("查询失败")
+        # --- Hermes bridge (lazy) ---
+        self._hermes = None
 
-        if results and isinstance(results[0], tuple) and results[0][0] == "__RAW__":
-            return results[0]
-        if results and results[0].strip().startswith("==="):
-            return ("__RAW__", results[0].strip())
-        return (None, "\n\n".join(results) if results else None)
+        logger.info("[%s] Started as %s (model: %s, subagents: %d)",
+                    agent_id, self.agent_name, llm_cfg["model"], max_subs)
 
-    def call_llm(self, user_message, tool_output=None, conversation_id=None):
-        """Call LLM, optionally with tool output injected."""
-        prompt = self.optimizer.get_enhanced_system_prompt()
-        if tool_output:
-            prompt += f"\n\n【工具已执行，以下是真实数据，必须基于此回复】\n{tool_output}"
-        else:
-            prompt += "\n\n【聊天模式】请根据角色设定自然回复。"
+    # =========================================================================
+    #  Helpers
+    # =========================================================================
 
-        # Session history
-        sf = f"{self.session_dir}/{conversation_id or 'default'}.json"
-        history = []
-        if os.path.exists(sf):
-            try:
-                with open(sf) as f:
-                    history = json.load(f)
-            except Exception:
-                history = []
+    def _refresh_token(self):
+        rc, out, err = run_script(
+            self.cfg.zentao_scripts_dir / "zentao-token-refresh.sh",
+            self.cfg.get_agent_account("zhangfei"),
+            timeout=10,
+        )
+        if rc != 0:
+            logger.warning("[%s] Token refresh failed (rc=%d): %s", self.agent_id, rc, err[:100])
 
-        messages = [{"role": "system", "content": prompt}]
-        messages.extend(history[-6:])
-        messages.append({"role": "user", "content": user_message})
+    def _zentao_write_bug(self, action: str, bid: str, comment: str):
+        """Write operation on zentao bug (resolve/assign)."""
+        run_script(
+            self.cfg.zentao_scripts_dir / "zentao-write-bug.sh",
+            action, bid, comment, timeout=30,
+        )
 
-        model = self.model_routes.get("analysis" if tool_output else "simple", self.model_routes["default"])
+    def reply_feishu(self, text: str, target_id: str = "", id_type: str = "chat_id"):
+        target = target_id or self.group_chat_id
+        formatted = f"**{self.agent_name}** 回复：\n\n{text}"
+        ok = self.feishu.send(formatted, target_id=target, id_type=id_type, agent_name=self.agent_name)
+        if not ok:
+            logger.warning("[%s] Feishu send failed (target=%s)", self.agent_id, target[:20])
 
-        import requests
-        resp = requests.post(f"{self.api_base}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": messages, "max_tokens": 2000, "temperature": 0.7},
-            timeout=180)
-        data = resp.json()
-        if not data.get("choices"):
-            return f"LLM 调用失败: {data}"
+    # =========================================================================
+    #  Tool execution — delegated to plugin registry
+    # =========================================================================
 
-        reply = data["choices"][0]["message"]["content"]
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": reply})
-        with open(sf, "w") as f:
-            json.dump(history[-10:], f, ensure_ascii=False, indent=2)
+    def execute_tools(self, message: str) -> tuple[Optional[str], Optional[str]]:
+        """Execute matching tools via registry."""
+        self._refresh_token()
+        return self.tool_registry.execute(message, self.tool_ctx)
 
-        # Async reflection
-        if tool_output:
-            threading.Thread(target=self.optimizer.reflect_on_task,
-                             args=(user_message, tool_output, reply, time.time()), daemon=True).start()
-        return reply
+    # =========================================================================
+    #  Intent routing
+    # =========================================================================
 
-    def send_feishu(self, text, target_id=None, id_type="chat_id"):
-        from agentforge.network.feishu import FeishuClient
-        client = FeishuClient(self.feishu_app["appId"], self.feishu_app["appSecret"], self.group_chat_id)
-        return client.send(text, target_id=target_id, id_type=id_type, agent_name=self.agent_name)
-
-    def should_respond(self, text):
+    def should_respond(self, text: str) -> bool:
         text_lower = text.lower()
-        my_score = sum(1 for kw in self.EXPERTISE.get(self.agent_id, []) if kw in text_lower)
+        my_keywords = self.cfg.expertise.get(self.agent_id, [])
+        my_score = sum(1 for kw in my_keywords if kw in text_lower)
         other_max = 0
-        for aid, kws in self.EXPERTISE.items():
+        for aid, kws in self.cfg.expertise.items():
             if aid == self.agent_id:
                 continue
             other_max = max(other_max, sum(1 for kw in kws if kw in text_lower))
         return my_score > 0 and my_score >= other_max and (my_score >= 2 or other_max == 0)
 
-    def ack(self, msg_id):
-        try:
-            self.redis.xack("agent-work-queue", f"{self.agent_id}-workers", msg_id)
-        except Exception:
-            pass
+    # =========================================================================
+    #  LLM calling
+    # =========================================================================
 
-    def handle_task(self, task):
+    def call_llm_with_tools(self, user_message: str, conversation_id: str,
+                            record_reflection: bool = False) -> str:
+        if self.cfg.hermes_enabled:
+            return self._call_hermes(user_message, conversation_id)
+
+        system_prompt = self.optimizer.get_enhanced_system_prompt()
+        history = self.sessions.load(conversation_id)
+
+        raw_flag, tool_output = self.execute_tools(user_message)
+        if raw_flag == "__RAW__":
+            return tool_output
+
+        if tool_output:
+            system_prompt += f"\n\n【⚠️ 工具已执行，以下是真实数据，必须基于此回复】\n{tool_output}"
+        else:
+            system_prompt += "\n\n【💡 聊天模式】用户正在进行非工具性对话。请根据角色设定自然回复。"
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history[-6:])
+        messages.append({"role": "user", "content": user_message})
+
+        model = self.llm.select_model("analysis" if tool_output else "simple")
+        logger.info("[%s] Using model: %s", self.agent_id, model)
+        traces.log(self.agent_id, "llm_call", model=model, task_id=conversation_id,
+                   status="with_tools" if tool_output else "chat")
+
+        _llm_start = time.time()
+        reply = self.llm.call(messages, model=model)
+        if reply:
+            traces.log(self.agent_id, "llm_done", model=model,
+                       duration_ms=int((time.time() - _llm_start) * 1000), status="ok")
+        if reply is None:
+            reply = "LLM 调用失败，请稍后重试"
+
+        self.sessions.append(conversation_id, user_message, reply)
+
+        if record_reflection and tool_output:
+            threading.Thread(
+                target=self.optimizer.reflect_on_task,
+                args=(user_message, tool_output, reply, time.time()),
+                daemon=True,
+            ).start()
+
+        return reply
+
+    def _call_hermes(self, user_message: str, conversation_id: str) -> str:
+        if self._hermes is None:
+            from agentforge.hermes_bridge import HermesAgentWrapper
+            self._hermes = HermesAgentWrapper(self.agent_id, hermes_home=str(self.cfg.hermes_home))
+        history = self.sessions.load(conversation_id)
+        reply = self._hermes.run(user_message, conversation_history=history[-6:])
+        if reply:
+            self.sessions.append(conversation_id, user_message, reply)
+        return reply or "Hermes 未返回结果"
+
+    # =========================================================================
+    #  Task handler — main dispatch
+    # =========================================================================
+
+    def handle_task(self, task: dict):
         message = task.get("message", "")
         target = task.get("agent_id", "")
         source = task.get("source", "")
+        msg_id = task.get("msg_id", "")
+        redis_id = task.get("_redis_id", "")  # Redis stream ID for ACK
 
-        # Route filtering
+        # --- Routing ---
         if target == "broadcast":
             if source == "ws_listener" and not self.should_respond(message):
-                self.ack(task["msg_id"]); return
+                self.ack(redis_id)
+                return
         elif target != self.agent_id:
-            self.ack(task["msg_id"]); return
+            self.ack(redis_id)
+            return
 
-        print(f"[{self.agent_id}] Processing: {message[:50]}...")
+        logger.info("[%s] Processing: %s (model: %s)", self.agent_id, message[:60], self.llm.model)
+        _task_start = time.time()
+        traces.log(self.agent_id, "task_start", task_id=msg_id, message=message[:100], model=self.llm.model)
 
-        # Pipeline: test (Zhangfei)
+        # --- Pipeline dispatch (delegated to pipeline module) ---
+        if source == "pm_analyze" and self.agent_id == "liubei":
+            handle_pm_analyze(self.pctx, task)
+            self.ack(redis_id)
+            return
         if source == "pipeline_fix_done" and self.agent_id == "zhangfei":
-            bm = re.search(r"#(\d{2,4})", message)
-            if bm:
-                bid = bm.group(1)
-                self.send_feishu(f"**测试报告**\n\nBug #{bid} 回归测试完成\n\n**测试通过**，流转给华佗验收...")
-                self.redis.xadd("agent-work-queue", {
-                    "agent_id": "huatuo",
-                    "message": f"请验收 Bug #{bid}，测试已通过，请确认后关闭。",
-                    "source": "pipeline_test_done", "sender_id": "zhangfei",
-                    "msg_id": f"pipeline-verify-{bid}", "timestamp": "now",
-                })
-                self.ack(task["msg_id"]); return
-
-        # Pipeline: verify (Huatuo) - 智能体不能关闭 Bug，只报告验收结果
+            handle_pipeline_test(self.pctx, task)
+            self.ack(redis_id)
+            return
         if source == "pipeline_test_done" and self.agent_id == "huatuo":
-            bm = re.search(r"#(\d{2,4})", message)
-            if bm:
-                bid = bm.group(1)
-                self.send_feishu(f"**验收通过**\n\nBug #{bid} 功能验证完成。\n\n⚠️ 请人类发起人手动关闭该 Bug（智能体无权关闭）。")
-                self.ack(task["msg_id"]); return
+            handle_pipeline_verify(self.pctx, task)
+            self.ack(redis_id)
+            return
+        if source == "self_boot_check" or source == "coordinator_scan":
+            handle_self_boot(self.pctx, task)
+            self.ack(redis_id)
+            return
 
-        # Autonomous fix (self-boot)
-        if source == "self_boot_check":
-            bm = re.search(r"#(\d{2,4})", message)
-            if bm:
-                bid = bm.group(1)
-                rc, out, _ = self._run_script("zentao-bug-query.sh", bid, timeout=15)
-                title = "Unknown"
-                if out:
-                    tm = re.search(r"Title:\s*(.*)", out)
-                    if tm:
-                        title = tm.group(1).strip()[:50]
-                self.send_feishu(f"**深度分析中**\n\nBug #{bid}: **{title}**\n\n正在修复...")
-                rc2, out2, _ = self._run_script("git-ops.sh", "commit", f"Fix #{bid}: {title}", timeout=30)
-                self._run_script("git-ops.sh", "push", timeout=30)
-                if rc2 == 0 or "没有需要提交的变更" in out2:
-                    self.send_feishu(f"**代码已推送**\n\nBug #{bid} 修复完成，等待人类确认并关闭。\n\n流转给张飞测试...")
-                    self.redis.xadd("agent-work-queue", {
-                        "agent_id": "zhangfei", "message": f"请测试 Bug #{bid} 的修复情况。",
-                        "source": "pipeline_fix_done", "sender_id": self.agent_id,
-                        "msg_id": f"pipeline-test-{bid}", "timestamp": "now",
-                    })
-                else:
-                    self.send_feishu(f"**修复受阻**\n\nBug #{bid} 提交失败。")
-                self.ack(task["msg_id"]); return
+        # --- Normal: tool + LLM ---
+        reply = self.call_llm_with_tools(message, msg_id, record_reflection=True)
+        if not reply:
+            self.ack(redis_id)
+            return
 
-        # Normal: tool + LLM
-        raw_flag, tool_out = self.execute_tools(message)
-        if raw_flag == "__RAW__":
-            reply = tool_out
+        chat_id = task.get("chat_id", "")
+        sender_id = task.get("sender_id", "")
+        is_dm = task.get("is_dm", "false") == "true"
+
+        if is_dm and sender_id:
+            self.feishu.send(
+                f"**{self.agent_name}** 回复：\n\n{reply}",
+                target_id=sender_id, id_type="open_id", agent_name=self.agent_name,
+            )
+            logger.info("[%s] Reply via DM to: %s", self.agent_id, sender_id)
         else:
-            reply = self.call_llm(message, tool_output=tool_out, conversation_id=task.get("msg_id"))
+            self.reply_feishu(reply)
+            logger.info("[%s] Reply to GROUP", self.agent_id)
 
-        if reply:
-            chat_id = task.get("chat_id", "")
-            sender_id = task.get("sender_id", "")
-            is_dm = task.get("is_dm", "false") == "true"
-            source = task.get("source", "")
+        self.ack(redis_id)
+        traces.log(self.agent_id, "task_done", task_id=msg_id,
+                   duration_ms=int((time.time() - _task_start) * 1000),
+                   status="ok")
 
-            # DM 消息 -> 回复给发送者私聊
-            if is_dm:
-                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
-                                 target_id=sender_id, id_type="open_id")
-                print(f"[{self.agent_id}] Reply via DM to: {sender_id}")
-            # 群聊消息 -> 回复到大群
-            elif chat_id == self.group_chat_id:
-                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
-                                 target_id=self.group_chat_id, id_type="chat_id")
-                print(f"[{self.agent_id}] Reply to GROUP")
-            # 工作流/系统任务 -> 回复到大群（除非指定了 reply_to）
-            elif source in ("workflow-engine", "self_boot_check", "pipeline_fix_done", "pipeline_test_done"):
-                reply_target = task.get("reply_to", self.group_chat_id)
-                reply_type = task.get("reply_type", "chat_id")
-                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
-                                 target_id=reply_target, id_type=reply_type)
-                print(f"[{self.agent_id}] Reply to {reply_type}:{reply_target}")
-            else:
-                # 兜底：回复到大群
-                self.send_feishu(f"**{self.agent_name}** 回复：\n\n{reply}",
-                                 target_id=self.group_chat_id, id_type="chat_id")
-                print(f"[{self.agent_id}] Reply to GROUP (fallback)")
+    def ack(self, redis_id: str):
+        try:
+            self.redis.xack(self.cfg.redis_stream, f"{self.agent_id}-workers", redis_id)
+        except Exception as e:
+            logger.error("[%s] ACK error: %s", self.agent_id, e)
 
-        # ACK
-        self.ack(task["msg_id"])
+    # =========================================================================
+    #  Boot check
+    # =========================================================================
 
     def boot_check(self):
-        rc, out, _ = self._run_script("zentao-my-bugs.sh", self.agent_id, "active", timeout=60)
-        if rc != 0 or not out:
+        # Liubei (PM) doesn't fix bugs — skip boot check
+        if self.agent_id == "liubei":
+            logger.info("[%s] Skipping boot check (PM role, no bug fixing)", self.agent_id)
             return
-        if "名下没有未解决的 Bug" in out or "当前所有任务已完成" in out:
-            return
-        bug_ids = list(set(re.findall(r"#(\d{2,4})", out)))
-        if not bug_ids:
-            return
-        lines = "\n".join(f"- {b}" for b in bug_ids[:5])
-        self.send_feishu(f"**开机自检**\n\n{self.agent_name} 发现 {len(bug_ids)} 个未解决 Bug：\n{lines}")
-        # Dispatch first bug as self-boot task
-        self.redis.xadd("agent-work-queue", {
-            "agent_id": self.agent_id, "message": f"请自动修复 Bug #{bug_ids[0]}",
-            "source": "self_boot_check", "sender_id": "system",
-            "msg_id": f"boot-{bug_ids[0]}", "timestamp": "now",
-        })
+
+        # Coordinator: zhugeliang scans ALL agent bugs and distributes
+        if self.coordinator:
+            logger.info("[%s] Running coordinator scan...", self.agent_id)
+            dispatched = self.coordinator.scan_and_dispatch(min_interval=0)
+            if dispatched > 0:
+                logger.info("[%s] Coordinator distributed %d bugs.", self.agent_id, dispatched)
+            # Still run own boot_check for zhugeliang's bugs
+            logger.info("[%s] Performing own boot check...", self.agent_id)
+        else:
+            logger.info("[%s] Performing boot check...", self.agent_id)
+
+        try:
+            self._refresh_token()
+            rc, out, _ = run_script(
+                self.cfg.zentao_scripts_dir / "zentao-my-bugs.sh",
+                self.agent_id, "active", timeout=60,
+            )
+            if rc != 0 or not out:
+                return
+            if "名下没有未解决的 Bug" in out or "当前所有任务已完成" in out:
+                logger.info("[%s] No active bugs found.", self.agent_id)
+                return
+
+            bug_ids = list(set(re.findall(r"#(\d{2,4})", out)))
+            if not bug_ids:
+                return
+
+            bug_list = "\n".join(f"- {b}" for b in bug_ids[:5])
+            self.reply_feishu(
+                f"🕵️ **开机自检报告**\n\n"
+                f"我是 {self.agent_name}。\n启动后自动扫描了禅道，发现名下还有 **{len(bug_ids)}** 个未解决的 Bug：\n"
+                f"{bug_list}\n\n🚀 正在进入自动修复模式..."
+            )
+
+            dispatched = 0
+            for bid in bug_ids[:3]:
+                qr, qo, _ = run_script(
+                    self.cfg.zentao_scripts_dir / "zentao-bug-query.sh", bid, timeout=15,
+                )
+                if qr != 0:
+                    logger.warning("[%s] Bug #%s query failed (rc=%d), skipping", self.agent_id, bid, qr)
+                    continue
+                bug_title = "Unknown"
+                bug_reporter = "未知"
+                if qo:
+                    tm = re.search(r'Title:\s*(.*)', qo)
+                    if tm:
+                        bug_title = tm.group(1).strip()[:50]
+                    rm = re.search(r'创建人:\s*(.*)', qo)
+                    if rm:
+                        bug_reporter = rm.group(1).strip()
+
+                # Spawn sub-agent for parallel fixing (not via Redis)
+                self.subpool.submit(self.subctx, bid, bug_title, bug_reporter)
+                dispatched += 1
+
+            logger.info("[%s] Boot check done. Spawned %d sub-agents.", self.agent_id, dispatched)
+        except Exception as e:
+            logger.error("[%s] Boot check failed: %s", self.agent_id, e)
+
+    # =========================================================================
+    #  Main loop
+    # =========================================================================
 
     def run(self):
-        # Ensure consumer group
+        stream = self.cfg.redis_stream
+        group = f"{self.agent_id}-workers"
+        consumer = f"{self.agent_id}-worker"
+
         try:
-            self.redis.xgroup_create("agent-work-queue", f"{self.agent_id}-workers", mkstream=True)
+            self.redis.xgroup_create(stream, group, mkstream=True)
         except Exception:
             pass
 
         self.boot_check()
-        print(f"[{self.agent_id}] Main loop started")
+        logger.info("[%s] Main loop started", self.agent_id)
 
+        last_status = 0
         while True:
             try:
-                # Pending first
                 result = self.redis.xreadgroup(
-                    groupname=f"{self.agent_id}-workers",
-                    consumername=f"{self.agent_id}-worker",
-                    streams={"agent-work-queue": "0"}, count=1, block=0)
+                    groupname=group, consumername=consumer,
+                    streams={stream: "0"}, count=1, block=0,
+                )
                 if not result or not result[0][1]:
                     result = self.redis.xreadgroup(
-                        groupname=f"{self.agent_id}-workers",
-                        consumername=f"{self.agent_id}-worker",
-                        streams={"agent-work-queue": ">"}, count=1, block=1000)
+                        groupname=group, consumername=consumer,
+                        streams={stream: ">"}, count=1, block=1000,
+                    )
+
                 if result:
-                    for stream, messages in result:
-                        for msg_id, fields in messages:
-                            self.handle_task({"msg_id": msg_id, **fields})
+                    for _, messages in result:
+                        for redis_id, fields in messages:
+                            # Redis stream ID stored under _redis_id so
+                            # it's not overwritten by Feishu msg_id in fields
+                            task = {"_redis_id": redis_id, **fields}
+                            try:
+                                self.handle_task(task)
+                            except Exception as e:
+                                logger.error("[%s] Task error: %s", self.agent_id, e)
+                                traces.log(self.agent_id, "error", message=str(e)[:200], status="error")
+
+                # Periodic sub-agent status (every 30s)
+                now_ts = time.time()
+                if now_ts - last_status > 30:
+                    active = self.subpool.active_count
+                    if active > 0:
+                        logger.info("[%s] Sub-agents active: %d", self.agent_id, active)
+                    last_status = now_ts
+
+                # Periodic coordinator scan (every 5 min, zhugeliang only)
+                if self.coordinator:
+                    self.coordinator.scan_and_dispatch(min_interval=300)
+
             except KeyboardInterrupt:
+                logger.info("[%s] Shutting down...", self.agent_id)
+                self.subpool.shutdown(wait=False)
                 break
             except Exception as e:
-                print(f"[{self.agent_id}] Error: {e}")
+                logger.error("[%s] Loop error: %s", self.agent_id, e)
                 time.sleep(5)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", required=True)
-    args = parser.parse_args()
-    EnhancedExecutor(args.agent).run()

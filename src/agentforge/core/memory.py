@@ -1,26 +1,30 @@
 """
-Experience Memory - Persistent experience storage for agents.
+Experience Memory — thread-safe persistent experience storage.
 
 Records task success/failure, stores tool patterns,
 remembers lessons, optimizes future behavior.
+
+Uses fcntl file locking to prevent concurrent write corruption.
 """
 
+import fcntl
 import json
 import os
 from datetime import datetime
+from typing import Optional
 
 
 class ExperienceMemory:
-    def __init__(self, agent_id, config=None):
+    def __init__(self, agent_id: str, config: Optional[object] = None):
         self.agent_id = agent_id
-        if config:
+        if config and hasattr(config, "get_agent_experience_path"):
             self.exp_file = config.get_agent_experience_path(agent_id)
         else:
             base = os.environ.get("AGENTS_CONFIG_DIR", "./config/agents")
             self.exp_file = f"{base}/{agent_id}/agent/.experience.json"
         self.data = self._load()
 
-    def _load(self):
+    def _load(self) -> dict:
         if os.path.exists(self.exp_file):
             try:
                 with open(self.exp_file) as f:
@@ -40,12 +44,23 @@ class ExperienceMemory:
         }
 
     def save(self):
+        """Thread-safe save using fcntl advisory lock."""
         os.makedirs(os.path.dirname(self.exp_file) or ".", exist_ok=True)
-        with open(self.exp_file, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        try:
+            with open(self.exp_file, "w", encoding="utf-8") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            # Fallback for non-UNIX or unavailable fcntl
+            with open(self.exp_file, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
 
-    def record_task(self, task_type, success, tool_used, time_taken,
-                    quality_score=None, error=None, improvement=None):
+    def record_task(self, task_type: str, success: bool, tool_used: str,
+                    time_taken: float, quality_score: Optional[int] = None,
+                    error: Optional[str] = None, improvement: Optional[str] = None):
         self.data["total_tasks"] += 1
         if success:
             self.data["successful_tasks"] += 1
@@ -83,7 +98,8 @@ class ExperienceMemory:
             self.data["failed_attempts"] = self.data["failed_attempts"][-30:]
         self.save()
 
-    def record_reflection(self, task, quality, improvement, time_taken):
+    def record_reflection(self, task: str, quality: int,
+                          improvement: Optional[str], time_taken: float):
         self.data["self_reflections"].append({
             "task": task[:200], "quality": quality,
             "improvement": improvement[:300] if improvement else None,
@@ -92,7 +108,7 @@ class ExperienceMemory:
         self.data["self_reflections"] = self.data["self_reflections"][-50:]
         self.save()
 
-    def get_best_tool(self, task_type):
+    def get_best_tool(self, task_type: str) -> Optional[dict]:
         if task_type in self.data["task_patterns"]:
             p = self.data["task_patterns"][task_type]
             if p["count"] > 2:
@@ -103,7 +119,7 @@ class ExperienceMemory:
                 }
         return None
 
-    def get_recent_lessons(self, limit=3):
+    def get_recent_lessons(self, limit: int = 3) -> list[str]:
         lessons = []
         for r in self.data["self_reflections"][-limit:]:
             if r.get("improvement"):
@@ -113,7 +129,7 @@ class ExperienceMemory:
                 lessons.append(f"教训: {f['lesson']}")
         return lessons
 
-    def get_performance_summary(self):
+    def get_performance_summary(self) -> str:
         total = self.data["total_tasks"]
         if total == 0:
             return "暂无执行记录"
