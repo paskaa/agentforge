@@ -270,7 +270,9 @@ def handle_pipeline_test(pctx: PipelineContext, task: dict):
         f"\n已指派回 {reporter} 在禅道中验证确认"
     )
 
-    if reporter_account:
+    # Human-account bugs: skip assign-back, keep original assignment
+    HUMAN_ACCOUNTS = {"chenxj", "sjjh", "admin", "doctor1", "ssshs1", "yangkexiang", "yangkeixang"}
+    if reporter_account and reporter_account.lower() not in HUMAN_ACCOUNTS:
         logger.info("[%s] Assigning Bug #%s back to %s", pctx.agent_id, bid, reporter_account)
         arc, aout, aerr = run_script(pctx.z("zentao-write-bug.sh"), "assign", bid, reporter_account,
                    assign_comment, timeout=30)
@@ -378,6 +380,17 @@ def handle_pipeline_verify(pctx: PipelineContext, task: dict):
         pctx.reply(f"❌ **验收不通过**\n\nBug #{bid} 修复改动量不足（或未找到提交），拒绝验收，退回重修。")
         return
 
+    # Human-account bugs: skip resolve + re-assign, keep as-is
+    reporter_account = ""
+    reporter_rmatch = re.search(r'\((\w+)\)', reporter)
+    if reporter_rmatch:
+        reporter_account = reporter_rmatch.group(1)
+    HUMAN_ACCOUNTS = {"chenxj", "sjjh", "admin", "doctor1", "ssshs1", "yangkexiang", "yangkeixang"}
+    if reporter_account and reporter_account.lower() in HUMAN_ACCOUNTS:
+        logger.info("[%s] Bug #%s reporter is human (%s), skipping resolve/re-assign", pctx.agent_id, bid, reporter_account)
+        pctx.reply(f"✅ **验证完成**\n\nBug #{bid} 修复已确认（人工Bug保持原指派）。")
+        return
+
     pctx.refresh_token()  # Ensure zentao token is fresh before write
     verify_comment = (
         f"🛡️ 由 {pctx.agent_name} 产品验收\n"
@@ -403,11 +416,8 @@ def handle_pipeline_verify(pctx: PipelineContext, task: dict):
         return
 
     # Re-assign back to reporter after resolve (resolve clears assignee)
-    reporter_account = ""
-    rmatch = re.search(r'\((\w+)\)', reporter)
-    if rmatch:
-        reporter_account = rmatch.group(1)
-    if reporter_account:
+    # reporter_account already computed above; only assign if NOT human
+    if reporter_account and reporter_account.lower() not in HUMAN_ACCOUNTS:
         run_script(pctx.z("zentao-write-bug.sh"), "assign", bid, reporter_account,
                    f"产品验收已通过，请确认关闭", timeout=15)
         logger.info("[%s] Re-assigned Bug #%s back to %s after resolve", pctx.agent_id, bid, reporter_account)
