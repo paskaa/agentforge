@@ -204,6 +204,13 @@ class Config:
     def get_agent_name(self, agent_id: str) -> str:
         return self.agent_names.get(agent_id, agent_id)
 
+    def get_agent_id_from_name(self, text: str) -> str | None:
+        """Find agent_id from Chinese name in text. e.g. '诸葛亮' → 'zhugeliang'"""
+        for aid, name in self.agent_names.items():
+            if name in text:
+                return aid
+        return None
+
     def get_agent_account(self, agent_id: str) -> str:
         return self.agent_accounts.get(agent_id, agent_id)
 

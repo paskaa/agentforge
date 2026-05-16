@@ -89,6 +89,11 @@ def download_image(url: str, bug_id: str, index: int = 0) -> Optional[Path]:
             timeout=30,
         )
         if resp.status_code == 200 and len(resp.content) > 100:
+            # Verify it's actually an image, not an HTML login page
+            header = resp.content[:4]
+            if header[:4] == b'<!DO' or header[:4] == b'<htm' or header[:5] == b'<HTML':
+                logger.warning("[images] Skipping non-image (HTML page) for Bug #%s", bug_id)
+                return None
             with open(cache_path, "wb") as f:
                 f.write(resp.content)
             logger.info("[images] Downloaded Bug #%s image %d: %s (%d bytes)",

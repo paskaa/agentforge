@@ -45,6 +45,16 @@ class Scheduler:
         self.tasks_file = "./config/scheduler_tasks.json"
         self.tasks = self._load_tasks()
 
+    def _refresh_token(self):
+        """Refresh Zentao token before API calls."""
+        try:
+            subprocess.run(
+                ["bash", str(self.scripts_dir / "zentao-token-refresh.sh"), "zhangfei"],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            pass
+
     def _load_tasks(self) -> dict:
         try:
             with open(self.tasks_file) as f:
@@ -116,10 +126,18 @@ class Scheduler:
         script = self.scripts_dir / "zentao-all-bugs.sh"
         if not script.exists():
             return
+        # Refresh token before query
+        self._refresh_token()
         r = subprocess.run(
             ["bash", str(script), "20"],
             capture_output=True, text=True, timeout=60,
         )
+        if r.returncode != 0 or "401" in (r.stdout or "") or "Authorization" in (r.stdout or ""):
+            self._refresh_token()
+            r = subprocess.run(
+                ["bash", str(script), "20"],
+                capture_output=True, text=True, timeout=60,
+            )
         if r.stdout.strip():
             msg = (
                 f"每日 Bug 汇总 ({datetime.now().strftime('%Y-%m-%d')})\n\n"

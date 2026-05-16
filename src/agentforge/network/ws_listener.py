@@ -52,7 +52,9 @@ def _get_redis() -> redis.Redis:
 def handle_message(ctx):
     try:
         msg_obj = ctx.event.message
-        if msg_obj.message_type != "text":
+        msg_type = getattr(msg_obj, "message_type", "unknown")
+        if msg_type != "text":
+            print(f"[WS:{AGENT_ID}] Skipped non-text message: type={msg_type}")
             return
         content = json.loads(msg_obj.content)
         text = content.get("text", "").strip()
@@ -61,25 +63,43 @@ def handle_message(ctx):
 
         chat_id = getattr(msg_obj, "chat_id", "unknown")
         chat_type = getattr(msg_obj, "chat_type", "unknown")
-        print(f"[WS:{AGENT_ID}] {text[:20]}... | {chat_type} | {chat_id}")
+        # Log mentions for debugging
+        mentions = getattr(msg_obj, "mentions", None) or []
+        mention_names = [m.name for m in mentions if hasattr(m, 'name')]
+        print(f"[WS:{AGENT_ID}] {text[:20]}... | {chat_type} | {chat_id} | mentions={mention_names}")
 
         is_dm = chat_type == "p2p"
         target = AGENT_ID if is_dm else None
 
         if not is_dm:
-            my_name = AGENT_NAMES.get(AGENT_ID, AGENT_ID)
-            if my_name in text or AGENT_ID in text:
-                target = AGENT_ID
+            # Route by Feishu native mentions (accurate @mention detection)
+            mentions = getattr(msg_obj, "mentions", None) or []
+            if mentions:
+                # Check if any mentioned user matches an agent
+                for m in mentions:
+                    m_name = getattr(m, 'name', '')
+                    m_id = getattr(m, 'id', {}).get('open_id', '') if isinstance(getattr(m, 'id', None), dict) else ''
+                    for aid, name in AGENT_NAMES.items():
+                        if name == m_name or m_id == aid:
+                            target = aid
+                            print(f"[WS] Mention route: {m_name} → {aid}")
+                            break
+                    if target:
+                        break
+            
+            # Fallback: @所有人 → broadcast
+            if not target and ("@所有人" in text or "@_user_1" in text):
+                target = "broadcast"
 
-        if target == AGENT_ID:
+        if target is not None:
             r = _get_redis()
-            r.xadd(REDIS_STREAM, {
-                "agent_id": AGENT_ID, "message": text, "source": "ws_listener",
+            r.rpush(REDIS_STREAM, json.dumps({
+                "agent_id": target, "message": text, "source": "ws_listener",
                 "sender_id": ctx.event.sender.sender_id.open_id,
                 "chat_id": chat_id, "is_dm": "true" if is_dm else "false",
                 "msg_id": msg_obj.message_id,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            })
+            }))
     except Exception as e:
         print(f"[WS:{AGENT_ID}] Error: {e}")
 
@@ -90,13 +110,32 @@ def main():
     app_id = creds["agents"][AGENT_ID]["appId"]
     app_secret = creds["agents"][AGENT_ID]["appSecret"]
     print(f"WS Listener starting for: {AGENT_ID}...")
-    cli = lark.ws.Client(
-        app_id=app_id, app_secret=app_secret,
-        log_level=lark.LogLevel.WARNING,
-        event_handler=lark.EventDispatcherHandler.builder("", "")
-        .register_p2_im_message_receive_v1(handle_message).build(),
-    )
-    cli.start()
+
+    import threading
+    last_msg_time = time.time()
+
+    def heartbeat_checker():
+        while True:
+            time.sleep(60)
+            if time.time() - last_msg_time > 600:  # 10 min no message
+                print(f"[WS:{AGENT_ID}] No message for 10min, triggering reconnect...")
+                os._exit(0)  # Force restart via systemd Restart=always
+
+    threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    while True:
+        try:
+            print(f"[WS:{AGENT_ID}] Connecting to Feishu WebSocket...")
+            cli = lark.ws.Client(
+                app_id=app_id, app_secret=app_secret,
+                log_level=lark.LogLevel.WARNING,
+                event_handler=lark.EventDispatcherHandler.builder("", "")
+                .register_p2_im_message_receive_v1(handle_message).build(),
+            )
+            cli.start()
+        except Exception as e:
+            print(f"[WS:{AGENT_ID}] Connection lost: {e}, reconnecting in 30s...")
+            time.sleep(30)
 
 
 if __name__ == "__main__":

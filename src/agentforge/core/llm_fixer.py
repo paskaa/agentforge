@@ -22,7 +22,7 @@ logger = logging.getLogger("agentforge.fixer")
 
 REPO_PATH = "/root/.openclaw/workspace/his-repo"
 SEARCH_EXTS = "*.vue,*.js,*.ts,*.java,*.xml,*.yml,*.properties"
-MAX_FILES = 3
+MAX_FILES = 5  # Increased for Java + Vue analysis
 MAX_LINES_PER_FILE = 200
 
 
@@ -82,7 +82,17 @@ class LLMFixer:
                             fix_summary=f"Search block not found in {file_path}")
             return False, f"无法应用 Bug #%s 的修复代码" % bug_id
 
-        # 5. Commit
+        # 5. Syntax check
+        syntax_ok, syntax_err = self._syntax_check(file_path)
+        if not syntax_ok:
+            # Revert the fix
+            self._git_checkout(file_path)
+            save_trajectory(bug_id, agent_name, "llm_fixer", False, time.time() - start,
+                            files_searched=files, generated_fix=fix_result,
+                            fix_summary=f"语法错误: {syntax_err[:100]}")
+            return False, f"语法检查失败: {syntax_err[:150]}"
+
+        # 6. Commit
         self._commit(bug_id, bug_title, agent_name)
 
         elapsed = time.time() - start
@@ -142,6 +152,16 @@ class LLMFixer:
             "检验申请": {"include": ["lab", "applicationForm", "inpatientDoctor"], "exclude": []},
             "医嘱": {"include": ["advice", "order", "inpatientDoctor"], "exclude": []},
         }
+        # Push Java files higher when backend keywords are present
+        BACKEND_KW = ["接口", "API", "api", "500", "会话", "session", "登录", "login",
+                      "权限", "permission", "配置", "config", "服务", "service",
+                      "查询", "query", "SQL", "sql", "mapper", "Controller"]
+        is_backend_bug = any(kw in title for kw in BACKEND_KW)
+        if is_backend_bug:
+            # Move Java files to the front
+            java_files = [f for f in files if f.endswith('.java')]
+            other_files = [f for f in files if not f.endswith('.java')]
+            return java_files + other_files
         # Find the most specific area match (longest match first)
         matched = None
         for area in sorted(AREA_MAP, key=len, reverse=True):
@@ -354,6 +374,64 @@ REPLACE:
         except Exception as e:
             logger.error("[fixer] Apply failed: %s", e)
             return False
+
+    def _syntax_check(self, file_path: str) -> tuple[bool, str]:
+        """Check syntax of the modified file. Returns (ok, error_message)."""
+        full = Path(REPO_PATH) / file_path
+        ext = full.suffix.lower()
+        try:
+            if ext == '.vue':
+                # Extract <script> block and check with node --check
+                import re as _re
+                with open(full) as f:
+                    content = f.read()
+                script_match = _re.search(r'<script[^>]*>(.*?)</script>', content, _re.DOTALL)
+                if script_match:
+                    import tempfile as _tf
+                    with _tf.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as tmp:
+                        tmp.write(script_match.group(1))
+                        tmp_path = tmp.name
+                    try:
+                        r = subprocess.run(
+                            ["node", "--check", tmp_path],
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        if r.returncode != 0:
+                            return False, r.stderr[:200] or "JS syntax error"
+                    finally:
+                        try:
+                            import os as _os
+                            _os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                return True, ""
+            elif ext in ('.js', '.ts', '.jsx', '.tsx'):
+                r = subprocess.run(
+                    ["node", "--check", str(full)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if r.returncode != 0:
+                    return False, r.stderr[:200] or "JS syntax error"
+                return True, ""
+            elif ext in ('.java',):
+                return True, ""
+            else:
+                return True, ""
+        except FileNotFoundError:
+            return True, ""
+        except Exception as e:
+            return True, str(e)
+
+    def _git_checkout(self, file_path: str):
+        """Revert a file to its last committed state."""
+        try:
+            subprocess.run(
+                ["git", "checkout", "--", file_path],
+                capture_output=True, text=True, timeout=10,
+                cwd=REPO_PATH,
+            )
+        except Exception:
+            pass
 
     def _commit(self, bug_id: str, bug_title: str, agent_name: str):
         """Commit the fix. Returns True on success."""

@@ -66,6 +66,13 @@ class FeishuClient:
                 },
                 timeout=15,
             )
+            if resp.status_code != 200:
+                import logging
+                logging.getLogger("agentforge.feishu").warning(
+                    "Feishu send failed: status=%d body=%s", resp.status_code, resp.text[:200]
+                )
             return resp.status_code == 200
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.getLogger("agentforge.feishu").warning("Feishu send exception: %s", e)
             return False

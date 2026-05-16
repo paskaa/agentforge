@@ -9,8 +9,10 @@ For each bug:
   - Report summary to Feishu group
 """
 
+import json
 import logging
 import re
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +64,11 @@ class Coordinator:
         self.redis_stream = redis_stream
         self.reply = reply_fn
         self._last_scan = 0
+        # Fallback token refresh
+        self.refresh_fn = lambda: subprocess.run(
+            ["bash", str(self.zentao_dir / "zentao-token-refresh.sh"), "zhangfei"],
+            capture_output=True, timeout=30,
+        )
 
     def scan_and_dispatch(self, min_interval: int = 300) -> int:
         now = time.time()
@@ -104,29 +111,21 @@ class Coordinator:
             logger.info("[coordinator] No agent bugs found.")
             return 0
 
-        # Filter + Route: skip humans, route by expertise
-        routed: dict[str, list[tuple[str, str]]] = {}  # target_agent -> [(bid, title)]
+        # Collect bugs for PM analysis + pipeline
+        liubei_bugs: list[tuple[str, str]] = []
+        human_fixed_bugs: list[tuple[str, str]] = []
         skipped_human = 0
-        human_fixed_bugs: list[tuple[str, str]] = []  # (bid, title) for pipeline
 
         for bid, title, assigned_agent in all_bugs:
-            # Liu Bei's bugs: send to PM for analysis and distribution
+            # Liu Bei's bugs: batch for PM analysis (PM is sole routing authority)
             if assigned_agent == "liubei":
-                # Skip if already routed (pm_routed exists for this bug)
-                if self._already_routed(bid):
-                    continue
-                self.redis.xadd(self.redis_stream, {
-                    "agent_id": "liubei",
-                    "message": f"请分析和分派 Bug #{bid}：{title}",
-                    "source": "pm_analyze",
-                    "sender_id": "coordinator",
-                    "chat_id": "",
-                    "is_dm": "true",
-                    "msg_id": f"coord-pm-analyze-{bid}-{int(time.time())}",
-                    "timestamp": datetime.now().isoformat(),
-                })
-                total += 1
+                if not self._already_routed(bid):
+                    liubei_bugs.append((bid, title))
                 continue
+
+            # Bugs assigned to other agents: already routed by PM, skip
+            if assigned_agent in ALL_AGENTS:
+                continue  # PM already handled these
 
             # Human-assigned bugs: skip fix, but start pipeline if already fixed in git
             if self._is_human_assigned(assigned_agent):
@@ -136,23 +135,11 @@ class Coordinator:
                     skipped_human += 1
                 continue
 
-            # Skip bugs already resolved in zentao
-            if self._is_resolved_in_zentao(bid):
-                logger.info("[coordinator] Bug #%s already resolved in zentao, skipping", bid)
-                continue
-
-            # Skip escalated bugs
+            # Deep re-fix: don't skip escalated or resolved bugs — re-examine everything
             if self._is_escalated(bid):
-                logger.info("[coordinator] Bug #%s escalated, skipping distribution", bid)
-                continue
-
-            # Route to best agent by expertise
-            best = self._route_bug(title, bid)
-            # Dynamic re-route: frontend bugs that failed 2+ times → backend
-            if best == "zhaoyun" and self._is_stuck_frontend(bid):
-                logger.info("[coordinator] Bug #%s rerouted: zhaoyun → guanyu (stuck frontend)", bid)
-                best = "guanyu"
-            routed.setdefault(best, []).append((bid, title))
+                logger.info("[coordinator] Bug #%s was escalated but re-queuing for deep re-fix", bid)
+            if self._is_resolved_in_zentao(bid):
+                logger.info("[coordinator] Bug #%s is resolved in zentao but re-queuing for deep re-fix", bid)
 
         # Agent display names
         names = {
@@ -160,27 +147,27 @@ class Coordinator:
             "xunyu": "荀彧", "zhangfei": "张飞", "huatuo": "华佗", "chenlin": "陈琳",
         }
 
-        # Dispatch up to 3 per agent (exclude liubei from fix tasks)
         total = 0
-        for target_agent, bugs in routed.items():
-            if target_agent == "liubei":
-                continue  # PM gets summary, not individual fix tasks
-            for bid, title in bugs[:3]:
-                self.redis.xadd(self.redis_stream, {
-                    "agent_id": target_agent,
-                    "message": f"请修复 Bug #{bid}：{title}",
-                    "source": "coordinator_scan",
-                    "sender_id": "coordinator",
-                    "chat_id": "",
-                    "is_dm": "true",
-                    "msg_id": f"coord-{target_agent}-{bid}-{int(time.time())}",
-                    "timestamp": datetime.now().isoformat(),
-                })
-                total += 1
+
+        # Batch PM analysis: send all liubei bugs at once
+        if liubei_bugs:
+            bug_lines = "\n".join(f"  #{b[0]}：{b[1][:60]}" for b in liubei_bugs[:10])
+            self.redis.rpush(self.redis_stream, json.dumps({
+                "agent_id": "liubei",
+                "message": f"请分析并分派以下 {len(liubei_bugs)} 个 Bug：\n{bug_lines}",
+                "source": "pm_analyze",
+                "sender_id": "coordinator",
+                "chat_id": "",
+                "is_dm": "true",
+                "msg_id": f"coord-pm-batch-{int(time.time())}",
+                "timestamp": datetime.now().isoformat(),
+            }))
+            total += len(liubei_bugs)
+            logger.info("[coordinator] Batched %d bugs for PM analysis", len(liubei_bugs))
 
         # Human-assigned bugs that were already fixed → zhangfei test pipeline
         for bid, title in human_fixed_bugs[:5]:
-            self.redis.xadd(self.redis_stream, {
+            self.redis.rpush(self.redis_stream, json.dumps({
                 "agent_id": "zhangfei",
                 "message": f"请测试 Bug #{bid} 的修复情况。提出人: 陈显精(chenxj)。",
                 "source": "pipeline_fix_done",
@@ -188,53 +175,24 @@ class Coordinator:
                 "bug_reporter": "陈显精(chenxj)",
                 "msg_id": f"coord-human-pipeline-{bid}",
                 "timestamp": datetime.now().isoformat(),
-            })
+            }))
             total += 1
         if human_fixed_bugs:
             logger.info("[coordinator] Injected %d human-assigned bugs into test pipeline", len(human_fixed_bugs))
 
-        # Send ONE summary to Liu Bei (PM) — full distribution report
-        if total > 0:  # Only if we distributed bugs
-            summary_lines = []
-            for aid, bugs in routed.items():
-                if aid == "liubei":
-                    continue
-                name = names.get(aid, aid)
-                bug_ids = ", ".join(f"#{b[0]}" for b in bugs[:3])
-                summary_lines.append(f"  {name}：{len(bugs)} 个 ({bug_ids})")
-            full_summary = (
-                f"协同扫描完成。共 {total} 个 Bug 已按专业分配：\n"
-                + "\n".join(summary_lines) +
-                f"\n\n我将跟进各负责人修复进度。"
-            )
-            self.redis.xadd(self.redis_stream, {
-                "agent_id": "liubei",
-                "message": full_summary,
-                "source": "coordinator_scan",
-                "sender_id": "coordinator",
-                "chat_id": "",
-                "is_dm": "true",
-                "msg_id": f"coord-liubei-summary-{int(time.time())}",
-                "timestamp": datetime.now().isoformat(),
-            })
-
         # Report
-        summary = []
-        for aid, bugs in routed.items():
-            name = names.get(aid, aid)
-            tag = "🔧" if aid == "zhaoyun" else "🛠️" if aid == "guanyu" else "🤖"
-            bug_ids_str = ', '.join('#'+b[0] for b in bugs[:2])
-            summary.append("  " + tag + " " + name + "：" + str(len(bugs)) + " 个 (" + bug_ids_str + ")")
+        if total > 0:
+            msg = f"🤖 **协同扫描报告**\n\n发现 {len(all_bugs)} 个待修复 Bug\n"
+            msg += f"📊 {len(liubei_bugs)} 个已发送给刘备进行专业分配。\n"
+            if human_fixed_bugs:
+                msg += f"🧪 {len(human_fixed_bugs)} 个人类 Bug 已修复，进入测试流程。\n"
+            if skipped_human > 0:
+                msg += f"⏸️ 跳过 {skipped_human} 个人类 Bug（未修复）。\n"
+            msg += f"\n🚀 共 **{total}** 个任务进入自主管线。"
+            self.reply(msg)
 
-        msg = f"🤖 **协同扫描报告**\n\n发现 {len(all_bugs)} 个待修复 Bug\n"
-        msg += f"已按专业领域智能路由到各 Agent：\n" + "\n".join(summary)
-        if skipped_human > 0:
-            msg += f"\n\n⏸️ 跳过 {skipped_human} 个分配给人类的 Bug（不处理）"
-        msg += f"\n🚀 共分发 **{total}** 个修复任务，并行执行中..."
-        self.reply(msg)
-
-        logger.info("[coordinator] Dispatched %d bugs across %d agents (%d human skipped).",
-                    total, len(routed), skipped_human)
+        logger.info("[coordinator] Batched %d to PM, %d human-fixed to pipeline (%d human skipped).",
+                    len(liubei_bugs), len(human_fixed_bugs), skipped_human)
         return total
 
     def _is_human_assigned(self, assigned_agent: str) -> bool:
@@ -277,11 +235,17 @@ class Coordinator:
             return False
 
     def _already_routed(self, bug_id: str) -> bool:
-        """Check if PM already routed this bug (pm_routed exists in stream)."""
+        """Check if PM already routed or is analyzing this bug (only recent messages)."""
         try:
-            for mid, fields in self.redis.xrange(self.redis_stream, '-', '+', count=50):
+            now = int(time.time() * 1000)
+            for mid, fields in self.redis.xrange(self.redis_stream, '-', '+', count=100):
                 src = fields.get('source', '')
-                if src == 'pm_routed' and str(bug_id) in fields.get('message', ''):
+                msg = fields.get('message', '')
+                # Only consider messages from last 60 minutes
+                msg_time = int(mid.split('-')[0]) if '-' in mid else 0
+                if now - msg_time > 3600000:  # 60 min
+                    continue
+                if str(bug_id) in msg and src in ('pm_routed', 'pm_analyze'):
                     return True
         except Exception:
             pass
@@ -290,9 +254,15 @@ class Coordinator:
     def _is_resolved_in_zentao(self, bug_id: str) -> bool:
         """Quick check if bug is already resolved in zentao. Avoids re-fixing."""
         try:
+            self.refresh_fn()
             rc, out, _ = run_script(
                 self.zentao_dir / "zentao-bug-query.sh", bug_id, timeout=10,
             )
+            if rc != 0 or "401" in (out or "") or "Authorization" in (out or ""):
+                self.refresh_fn()
+                rc, out, _ = run_script(
+                    self.zentao_dir / "zentao-bug-query.sh", bug_id, timeout=10,
+                )
             if rc == 0 and out:
                 return "resolved" in out.lower() or "已解决" in out
         except Exception:

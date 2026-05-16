@@ -8,6 +8,7 @@ This replaces the old pattern of enqueuing self_boot tasks to Redis
 (which serialized them) with true parallel execution.
 """
 
+import json
 import logging
 import re
 import subprocess
@@ -83,10 +84,9 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
     start = _time.time()
     logger.info("[subagent:%s] Starting fix for Bug #%s: %s", ctx.agent_id, bid, bug_title[:50])
 
-    # 0. Check escalation — don't try bugs that already failed many times
+    # 0. Previously escalated bugs: allow re-fix (escalation no longer blocks)
     if _check_escalation(bid, ctx.agent_name, ctx):
-        logger.info("[subagent:%s] Bug #%s escalated, skipping auto-fix", ctx.agent_id, bid)
-        return
+        logger.info("[subagent:%s] Bug #%s was escalated but re-attempting with deep re-fix", ctx.agent_id, bid)
 
     # 1. Reproduce bug in local test environment
     try:
@@ -122,10 +122,33 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
     cerr = ""
     crc = 1
 
-    if ctx.llm_fixer:
+    # QPM rate limiter: Redis SETNX distributed lock — only 1 Claude Code globally
+    import time as _time
+    _redis_lock_key = "claude_code_lock"
+    _acquired = False
+    for _attempt in range(600):  # Wait up to 10 minutes
+        if ctx.redis.set(_redis_lock_key, ctx.agent_id, nx=True, ex=600):
+            _acquired = True
+            logger.info("[subagent:%s] Acquired Redis lock for Claude Code", ctx.agent_id)
+            break
+        _time.sleep(1)
+    if not _acquired:
+        logger.error("[subagent:%s] Redis lock timeout after 10 min", ctx.agent_id)
+        ctx.reply(f"⚠️ Claude Code 分布锁等待超时，Bug #{bug_id} 稍后重试")
+        return
+
+    # Record task start in Redis status hash
+    ctx.redis.hset("task:status", bug_id, json.dumps({
+        "agent": ctx.agent_id, "bug_id": bug_id, "status": "running",
+        "start": datetime.now().isoformat()[:19], "elapsed": "",
+    }))
+    ctx.redis.expire("task:status", 1800)  # Auto-expire after 30 min
+
+    # LLM Fixer disabled — always use Claude Code directly
+    llm_disabled = True
+    if not llm_disabled and ctx.llm_fixer:
         logger.info("[subagent:%s] Trying LLM direct fix for Bug #%s", ctx.agent_id, bid)
         try:
-            # Pass image info to LLM fixer for better diagnosis
             fix_steps = image_desc if image_desc else ""
             success, msg = ctx.llm_fixer.fix(bid, bug_title, fix_steps, ctx.agent_name)
             if success:
@@ -154,11 +177,30 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
                     "\n\n**后端开发重点**：优先搜索 Java/Spring 后端代码。"
                     "关键词：Controller, Service, Mapper, API, 接口"
                 )
-            crc, cout, cerr = run_script(
-                ctx.z("claude-code-fix.sh"),
-                bid, claude_title, ctx.agent_name,
-                timeout=10800,
-            )
+            # Start a background thread to periodically flush Claude Code output to Redis
+            import threading as _threading, io as _io
+            _log_buf = _io.StringIO()
+            def _pipe_to_redis():
+                try:
+                    with subprocess.Popen(
+                        [ctx.z("claude-code-fix.sh"), bid, claude_title, ctx.agent_name],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10800,
+                    ) as _p:
+                        for _line in _p.stdout:
+                            _log_buf.write(_line)
+                            if _log_buf.tell() > 500:
+                                ctx.redis.set(f"task:log:{bid}", _log_buf.getvalue()[-4000:], ex=600)
+                    ctx.redis.set(f"task:log:{bid}", _log_buf.getvalue()[-8000:], ex=600)
+                except Exception:
+                    pass
+            
+            _log_thread = _threading.Thread(target=_pipe_to_redis, daemon=True)
+            _log_thread.start()
+            _log_thread.join(timeout=10800)
+            
+            cout = _log_buf.getvalue()
+            crc = 1 if "⚠️ Claude Code 退出码: 1" in cout or "exit=1" in cout else 0
+            cerr = ""
         except Exception as e:
             ctx.reply(f"⚠️ **修复异常**\n\nBug #{bid}: {e}")
             logger.error("[subagent:%s] Bug #%s fix exception: %s", ctx.agent_id, bid, e)
@@ -166,10 +208,42 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
 
     elapsed = _time.time() - start
 
-    # Save trajectory for Claude Code
+    # Build a meaningful summary
+    summary = "committed"
+    if crc != 0:
+        # Extract last meaningful error line from stdout/stderr
+        err_lines = (cerr.strip() + "\n" + cout.strip()).split("\n")
+        last_err = ""
+        for line in reversed(err_lines):
+            line = line.strip()
+            if line and not line.startswith("=") and not line.startswith("-"):
+                last_err = line[:120]
+                break
+        summary = f"exit={crc}: {last_err}" if last_err else f"exit={crc}"
+
     save_trajectory(bid, ctx.agent_name, "claude_code" if not fixed else "llm_fixer", crc == 0, elapsed,
                     stdout=cout, stderr=cerr,
-                    fix_summary=f"exit={crc}" if crc != 0 else "committed")
+                    fix_summary=summary)
+
+    # Auto-retry on API quota failure
+    if crc != 0 and "429" in cout:
+        logger.warning("[subagent:%s] Bug #%s hit API quota, auto-retry in 5min", ctx.agent_id, bid)
+        ctx.reply(f"⏳ Bug #{bid} 因 API 配额限制暂时失败，5 分钟后自动重试...")
+        _time.sleep(300)
+        # Release lock before re-enqueue
+        try: ctx.redis.delete("claude_code_lock")
+        except: pass
+        # Re-enqueue
+        ctx.redis.rpush(ctx.redis_stream, json.dumps({
+            "agent_id": ctx.agent_id,
+            "message": f"请修复 Bug #{bid}（API配额已恢复，自动重试）",
+            "source": "pm_routed",
+            "sender_id": "auto_retry",
+            "chat_id": "", "is_dm": "true",
+            "msg_id": f"auto-retry-{bid}-{int(_time.time())}",
+            "timestamp": datetime.now().isoformat(),
+        }))
+        return
 
     # Write analysis comment to zentao (success or failure)
     try:
@@ -232,7 +306,7 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
                 f"🫡 流转给 **张飞** 进行回归测试..."
             )
             # Pipeline handoff
-            ctx.redis.xadd(ctx.redis_stream, {
+            ctx.redis.rpush(ctx.redis_stream, json.dumps({
                 "agent_id": "zhangfei",
                 "message": f"请测试 Bug #{bid} 的修复情况。提出人: {bug_reporter}。",
                 "source": "pipeline_fix_done",
@@ -240,7 +314,7 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
                 "bug_reporter": bug_reporter,
                 "msg_id": f"pipeline-test-{bid}",
                 "timestamp": datetime.now().isoformat(),
-            })
+            }))
         else:
             ctx.reply(
                 f"⚠️ **修复未确认** ({elapsed:.0f}s)\n\n"
@@ -266,6 +340,20 @@ def _run_autonomous_fix(ctx: SubAgentContext, bid: str, bug_title: str, bug_repo
 
     logger.info("[subagent:%s] Bug #%s done in %.0fs (exit=%d)",
                 ctx.agent_id, bid, elapsed, crc)
+
+    # Release Redis lock + update task status
+    try:
+        ctx.redis.delete("claude_code_lock")
+        ctx.redis.hset("task:status", bug_id, json.dumps({
+            "agent": ctx.agent_id, "bug_id": bug_id,
+            "status": "done" if crc == 0 else "failed",
+            "start": datetime.now().isoformat()[:19],
+            "elapsed": f"{elapsed:.0f}s",
+            "exit": crc,
+        }))
+        logger.info("[subagent:%s] Released Redis lock", ctx.agent_id)
+    except Exception:
+        pass
 
     # After failure, check if we just crossed the escalation threshold
     if crc != 0:
@@ -333,9 +421,33 @@ def _check_escalation(bug_id: str, agent_name: str, ctx: object) -> bool:
                 method = t.get("method", "unknown")
                 failures[method] = failures.get(method, 0) + 1
 
-        # Escalation rule: ≥2 methods tried AND total failures ≥3
+        # Smart escalation: frontend/DBA failures → reroute to backend (guanyu)
         unique_methods = len(failures)
         total_failures = sum(failures.values())
+
+        # Reroute rule: frontend or DBA agent failed 2+ times → send to guanyu
+        reroute_agents = {"赵云", "荀彧", "zhaoyun", "xunyu"}  # Both Chinese and English names
+        if (agent_name in reroute_agents or ctx.agent_id in reroute_agents) and total_failures >= 2:
+            logger.warning("[subagent] Bug #%s rerouted: %s → guanyu (backend)", bug_id, agent_name)
+            try:
+                ctx.redis.rpush(ctx.redis_stream, json.dumps({
+                    "agent_id": "guanyu",
+                    "message": f"请修复 Bug #{bug_id}（{agent_name} 修复受阻，疑似后端问题，转关羽处理）",
+                    "source": "rerouted_to_backend",
+                    "sender_id": agent_name,
+                    "chat_id": "",
+                    "is_dm": "true",
+                    "msg_id": f"reroute-{bug_id}-{int(time.time())}",
+                    "timestamp": datetime.now().isoformat(),
+                }))
+                ctx.reply(
+                    f"🔄 **Bug #{bug_id} 已转派**\n\n"
+                    f"{agent_name} 修复 2 次未成功，疑似后端问题。\n"
+                    f"已转派给 **关羽** 处理。"
+                )
+            except Exception as e:
+                logger.error("[subagent] Reroute failed: %s", e)
+            return True  # Signal: don't try again with current agent
 
         if unique_methods >= 2 and total_failures >= 3:
             logger.warning("[subagent] Bug #%s ESCALATED: %d methods, %d failures → manual intervention",

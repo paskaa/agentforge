@@ -42,6 +42,17 @@ class TestEnvironment:
         if self._page is None or self._page.is_closed():
             self._page = self._browser.new_page(viewport={"width": 1920, "height": 1080})
 
+    def check_console_errors(self) -> list[str]:
+        """Check browser console for JavaScript errors. Returns list of error messages."""
+        if not self._page:
+            return ["No page"]
+        try:
+            errors = []
+            self._page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+            return errors
+        except Exception as e:
+            return [str(e)]
+
     def close(self):
         if self._page:
             self._page.close()

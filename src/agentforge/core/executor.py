@@ -12,6 +12,7 @@ Architecture (v2):
   - Config → config.py (dataclass, single source of truth)
 """
 
+import json
 import logging
 import os
 import re
@@ -30,12 +31,14 @@ from agentforge.core.pipeline import (
     PipelineContext,
     handle_pipeline_test,
     handle_pipeline_verify,
+    handle_chenlin_doc,
     handle_self_boot,
     handle_pm_analyze,
 )
 from agentforge.core.subagent import SubAgentPool, SubAgentContext
 from agentforge.core.coordinator import Coordinator
 from agentforge.core.trace_store import traces
+from agentforge.core.quota_monitor import mark_rate_limited, is_rate_limited
 from agentforge.network.feishu import FeishuClient
 
 logger = logging.getLogger("agentforge.executor")
@@ -109,9 +112,9 @@ class AgentExecutor:
         from agentforge.core.optimizer import SelfOptimizer
         self.optimizer = SelfOptimizer(agent_id=agent_id, config=self.cfg)
 
-        # --- LLM Fixer (direct fix via qwen3-coder-plus, bypasses Claude Code) ---
-        from agentforge.core.llm_fixer import LLMFixer
-        self.llm_fixer = LLMFixer(self.llm)
+        # --- LLM Fixer (disabled — Claude Code handles all fixes) ---
+        # from agentforge.core.llm_fixer import LLMFixer
+        # self.llm_fixer = LLMFixer(self.llm)
 
         # --- SubAgent Pool (parallel bug fixing) ---
         max_subs = int(os.environ.get("SUBAGENT_MAX", "3").split("#")[0].strip())
@@ -125,12 +128,12 @@ class AgentExecutor:
             reply_fn=self.reply_feishu,
             refresh_fn=self._refresh_token,
             zentao_write_bug=self._zentao_write_bug,
-            llm_fixer=self.llm_fixer,
+            llm_fixer=None,  # LLM Fixer disabled
         )
 
         # --- Coordinator (only zhugeliang runs cross-agent scans) ---
         self.coordinator = None
-        if agent_id == "zhugeliang":
+        if agent_id in ("zhugeliang", "liubei"):
             self.coordinator = Coordinator(
                 zentao_dir=self.cfg.zentao_scripts_dir,
                 agent_accounts=self.cfg.agent_accounts,
@@ -150,7 +153,12 @@ class AgentExecutor:
     #  Helpers
     # =========================================================================
 
-    def _refresh_token(self):
+    def _refresh_token(self, force: bool = False):
+        """Refresh zentao token with TTL caching (max once per 5 min)."""
+        now = time.time()
+        if not force and hasattr(self, '_token_refreshed_at') and now - self._token_refreshed_at < 300:
+            return  # Token is fresh enough
+        self._token_refreshed_at = now
         rc, out, err = run_script(
             self.cfg.zentao_scripts_dir / "zentao-token-refresh.sh",
             self.cfg.get_agent_account("zhangfei"),
@@ -169,9 +177,13 @@ class AgentExecutor:
     def reply_feishu(self, text: str, target_id: str = "", id_type: str = "chat_id"):
         target = target_id or self.group_chat_id
         formatted = f"**{self.agent_name}** 回复：\n\n{text}"
+        traces.log(self.agent_id, "feishu_reply", message=text[:200], status="sending")
         ok = self.feishu.send(formatted, target_id=target, id_type=id_type, agent_name=self.agent_name)
         if not ok:
+            traces.log(self.agent_id, "feishu_reply", status="failed")
             logger.warning("[%s] Feishu send failed (target=%s)", self.agent_id, target[:20])
+        else:
+            traces.log(self.agent_id, "feishu_reply", message=text[:200], status="ok")
 
     # =========================================================================
     #  Tool execution — delegated to plugin registry
@@ -187,6 +199,28 @@ class AgentExecutor:
     # =========================================================================
 
     def should_respond(self, text: str) -> bool:
+        # Direct mention always wins (highest priority)
+        agent_name_en = self.cfg.get_agent_id_from_name(text) if hasattr(self.cfg, 'get_agent_id_from_name') else None
+        if agent_name_en and agent_name_en == self.agent_id:
+            return True
+
+        # @all messages: best-matched agent answers (not everyone)
+        if "@_user_1" in text or "@所有人" in text:
+            text_lower = text.lower()
+            my_keywords = self.cfg.expertise.get(self.agent_id, [])
+            my_score = sum(1 for kw in my_keywords if kw in text_lower)
+            other_max = 0
+            for aid, kws in self.cfg.expertise.items():
+                if aid == self.agent_id:
+                    continue
+                s = sum(1 for kw in kws if kw in text_lower)
+                if s > other_max:
+                    other_max = s
+            # PM is fallback when no one matches
+            if my_score > other_max or (my_score == other_max and self.agent_id == "liubei"):
+                return True
+            return False
+
         text_lower = text.lower()
         my_keywords = self.cfg.expertise.get(self.agent_id, [])
         my_score = sum(1 for kw in my_keywords if kw in text_lower)
@@ -203,8 +237,12 @@ class AgentExecutor:
 
     def call_llm_with_tools(self, user_message: str, conversation_id: str,
                             record_reflection: bool = False) -> str:
-        if self.cfg.hermes_enabled:
-            return self._call_hermes(user_message, conversation_id)
+        if self.cfg.hermes_enabled and not is_rate_limited(self.agent_id):
+            result = self._call_hermes(user_message, conversation_id)
+            if result and "未返回结果" not in result:
+                return result
+            # Hermes returned empty (likely 429) → fall through to direct LLM
+            mark_rate_limited(self.agent_id)
 
         system_prompt = self.optimizer.get_enhanced_system_prompt()
         history = self.sessions.load(conversation_id)
@@ -268,17 +306,50 @@ class AgentExecutor:
         redis_id = task.get("_redis_id", "")  # Redis stream ID for ACK
 
         # --- Routing ---
+        # coordinator_scan / pm_routed: any fix agent can process
+        # pipeline_* / self_boot_check: must route to specific agent
+        pipeline_sources = ("pipeline_fix_done", "pipeline_test_done", "pm_analyze", 
+                           "rerouted_to_backend", "self_boot_check")
+        fix_agents = ("zhaoyun", "guanyu", "xunyu")
+        
+        if source in pipeline_sources and target != self.agent_id:
+            # Pipeline message for wrong agent: re-push to queue
+            self.redis.rpush(self.cfg.redis_stream, json.dumps(task))
+            return
+        
+        if source == "coordinator_scan" and self.agent_id not in fix_agents:
+            # Non-fix agent should not process coordinator_scan
+            return
+        
         if target == "broadcast":
             if source == "ws_listener" and not self.should_respond(message):
-                self.ack(redis_id)
                 return
-        elif target != self.agent_id:
-            self.ack(redis_id)
-            return
+
+        # PM: convert "@all 分配XX的Bug" into targeted distribution
+        # Only trigger on explicit commands: "开始分配", "全部分配", "执行分配"
+        if self.agent_id == "liubei" and source == "ws_listener" and message:
+            trigger_words = ["开始分配", "全部分配", "执行分配", "立刻分配", "立即分配",
+                           "马上分配", "把所有bug分配", "把所有Bug分配"]
+            if not any(w in message for w in trigger_words):
+                pass  # Don't trigger on casual mentions of "分配"
+            elif "分配" in message or "分派" in message:
+                import re as _re
+                # Extract human name: "分配王怡哲的bug" → wangyizhe, "分配给陈显精" → chenxj
+                name_map = {"王怡哲": "wangyizhe", "陈显精": "chenxj"}
+                target_human = None
+                for name, account in name_map.items():
+                    if name in message:
+                        target_human = account
+                        break
+                if target_human:
+                    logger.info("[liubei] PM distributing bugs for: %s", target_human)
+                    self.reply_feishu(f"📊 **收到分配请求**\n\n正在查询 {target_human} 名下的 Bug 并按专业领域分派给智能体...")
+                    self.ack(redis_id)
+                    self._handle_human_bug_distribution(target_human)
+                    return
 
         logger.info("[%s] Processing: %s (model: %s)", self.agent_id, message[:60], self.llm.model)
         _task_start = time.time()
-        traces.log(self.agent_id, "task_start", task_id=msg_id, message=message[:100], model=self.llm.model)
 
         # --- Pipeline dispatch (delegated to pipeline module) ---
         if source == "pm_analyze" and self.agent_id == "liubei":
@@ -291,11 +362,23 @@ class AgentExecutor:
             return
         if source == "pipeline_test_done" and self.agent_id == "huatuo":
             handle_pipeline_verify(self.pctx, task)
+        if source == "pipeline_test_done" and self.agent_id == "chenlin":
+            handle_chenlin_doc(self.pctx, task)
             self.ack(redis_id)
             return
-        if source == "self_boot_check" or source == "coordinator_scan":
+        if source == "rerouted_to_backend" and self.agent_id == "guanyu":
             handle_self_boot(self.pctx, task)
             self.ack(redis_id)
+            return
+        if source == "pm_routed":
+            traces.log(self.agent_id, "task_start", task_id=msg_id, message=message[:100], model=self.llm.model)
+            handle_self_boot(self.pctx, task)
+            time.sleep(10)  # Cooldown — wait for Claude Code to start
+            return
+        if source == "self_boot_check" or source == "coordinator_scan":
+            traces.log(self.agent_id, "task_start", task_id=msg_id, message=message[:100], model=self.llm.model)
+            handle_self_boot(self.pctx, task)
+            time.sleep(10)  # Cooldown
             return
 
         # --- Normal: tool + LLM ---
@@ -303,6 +386,9 @@ class AgentExecutor:
         if not reply:
             self.ack(redis_id)
             return
+
+        # After Hermes/LLM replies, check if message implies a pipeline action
+        self._maybe_trigger_pipeline(message, reply, task, redis_id)
 
         chat_id = task.get("chat_id", "")
         sender_id = task.get("sender_id", "")
@@ -323,11 +409,82 @@ class AgentExecutor:
                    duration_ms=int((time.time() - _task_start) * 1000),
                    status="ok")
 
-    def ack(self, redis_id: str):
+    def _handle_human_bug_distribution(self, human_account: str = ""):
+        """Query human-assigned bugs and inject them into PM analysis pipeline."""
+        import subprocess
+        humans = [human_account] if human_account else ["wangyizhe", "chenxj"]
+        self._refresh_token()
+        for human in humans:
+            r = subprocess.run(
+                [str(self.cfg.zentao_scripts_dir / "zentao-my-bugs.sh"), human, "active"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0 or "401" in (r.stdout or "") or "Authorization" in (r.stdout or ""):
+                logger.warning("[%s] Human bug query failed for %s, refreshing and retrying", self.agent_id, human)
+                self._refresh_token()
+                r = subprocess.run(
+                    [str(self.cfg.zentao_scripts_dir / "zentao-my-bugs.sh"), human, "active"],
+                    capture_output=True, text=True, timeout=60,
+                )
+            if r.returncode != 0 or not r.stdout:
+                continue
+            # Parse bug IDs and titles
+            import re
+            bugs = re.findall(r"#(\d{2,4})\s*[：:]\s*(.+?)(?:\n|$)", r.stdout)
+            if not bugs:
+                continue
+            # Build PM analyze message
+            bug_lines = "\n".join(f"  #{b[0]}：{b[1][:60]}" for b in bugs[:10])
+            self.redis.rpush(self.cfg.redis_stream, json.dumps({
+                "agent_id": "liubei",
+                "message": f"请分析并分派以下 {len(bugs)} 个人类 Bug（{human}）：\n{bug_lines}",
+                "source": "pm_analyze",
+                "sender_id": "coordinator",
+                "chat_id": "",
+                "is_dm": "true",
+                "msg_id": f"human-batch-{int(time.time())}",
+                "timestamp": datetime.now().isoformat(),
+            }))
+            logger.info("[liubei] Injected %d bugs from %s into PM analysis", len(bugs), human)
+
+    def _maybe_trigger_pipeline(self, message: str, reply: str, task: dict, redis_id: str):
+        """After Hermes/LLM replies, check if user message asks for pipeline actions."""
+        if self.agent_id != "liubei":
+            return
+
+        # Only trigger distribution when user explicitly says "开始分配" or "全部分配" or "执行分配"
+        # NOT when Hermes analyzes/talks about bugs in conversation
+        trigger_words = ["开始分配", "全部分配", "执行分配", "立刻分配", "立即分配",
+                        "马上分配", "把所有bug分配", "把所有Bug分配"]
+        if not any(w in message for w in trigger_words):
+            return
+
+        import re as _re
+        name_map = {"王怡哲": "wangyizhe", "陈显精": "chenxj",
+                    "shiyiming": "shiyiming", "史一鸣": "shiyiming",
+                    "杨科祥": "yangkexiang", "yangkexiang": "yangkexiang"}
+        target = None
+        for name, account in name_map.items():
+            if name in message or name in reply:
+                target = account
+                break
+        if target:
+            logger.info("[liubei] Pipeline trigger (explicit): distributing bugs for %s", target)
+            self.reply_feishu(f"📊 **收到执行命令**\n\n正在查询 {target} 名下 Bug 并分派给智能体处理...")
+            self._handle_human_bug_distribution(target)
+
+    def _trim_stream(self):
+        """Remove stream messages older than 1 hour to prevent unbounded growth."""
         try:
-            self.redis.xack(self.cfg.redis_stream, f"{self.agent_id}-workers", redis_id)
+            cutoff = int((time.time() - 3600) * 1000)  # 1 hour ago in ms
+            deleted = self.redis.xtrim(self.cfg.redis_stream, minid=str(cutoff) + "-0", approximate=True)
+            if deleted:
+                logger.debug("[%s] Stream trimmed: %s messages", self.agent_id, deleted)
         except Exception as e:
-            logger.error("[%s] ACK error: %s", self.agent_id, e)
+            logger.debug("[%s] Stream trim skipped: %s", self.agent_id, e)
+
+    def ack(self, redis_id: str):
+        pass  # BLPOP auto-removes, no ACK needed
 
     # =========================================================================
     #  Boot check
@@ -374,9 +531,16 @@ class AgentExecutor:
             )
 
             dispatched = 0
+            self._refresh_token()
             for bid in bug_ids[:3]:
                 qr, qo, _ = run_script(
                     self.cfg.zentao_scripts_dir / "zentao-bug-query.sh", bid, timeout=15,
+                )
+                if qr != 0 or "401" in (qo or "") or "Authorization" in (qo or ""):
+                    logger.warning("[%s] Bug query failed for #%s, refreshing and retrying", self.agent_id, bid)
+                    self._refresh_token()
+                    qr, qo, _ = run_script(
+                        self.cfg.zentao_scripts_dir / "zentao-bug-query.sh", bid, timeout=15,
                 )
                 if qr != 0:
                     logger.warning("[%s] Bug #%s query failed (rc=%d), skipping", self.agent_id, bid, qr)
@@ -404,42 +568,43 @@ class AgentExecutor:
     # =========================================================================
 
     def run(self):
-        stream = self.cfg.redis_stream
-        group = f"{self.agent_id}-workers"
-        consumer = f"{self.agent_id}-worker"
-
-        try:
-            self.redis.xgroup_create(stream, group, mkstream=True)
-        except Exception:
-            pass
-
+        # Each fix agent has its own dedicated queue — no race
+        fix_queues = {"zhaoyun": self.cfg.redis_stream + ":fix:zhaoyun",
+                      "guanyu": self.cfg.redis_stream + ":fix:guanyu",
+                      "xunyu": self.cfg.redis_stream + ":fix:xunyu"}
+        if self.agent_id in fix_queues:
+            stream = fix_queues[self.agent_id]
+        else:
+            stream = self.cfg.redis_stream
         self.boot_check()
-        logger.info("[%s] Main loop started", self.agent_id)
+        logger.info("[%s] Main loop started (stream=%s)", self.agent_id, stream)
 
         last_status = 0
         while True:
             try:
-                result = self.redis.xreadgroup(
-                    groupname=group, consumername=consumer,
-                    streams={stream: "0"}, count=1, block=0,
-                )
-                if not result or not result[0][1]:
-                    result = self.redis.xreadgroup(
-                        groupname=group, consumername=consumer,
-                        streams={stream: ">"}, count=1, block=1000,
-                    )
-
+                # If another agent holds the Claude Code lock, wait before polling
+                if self.redis.exists("claude_code_lock"):
+                    time.sleep(5)
+                    continue
+                result = self.redis.blpop(stream, timeout=10)
                 if result:
-                    for _, messages in result:
-                        for redis_id, fields in messages:
-                            # Redis stream ID stored under _redis_id so
-                            # it's not overwritten by Feishu msg_id in fields
-                            task = {"_redis_id": redis_id, **fields}
-                            try:
-                                self.handle_task(task)
-                            except Exception as e:
-                                logger.error("[%s] Task error: %s", self.agent_id, e)
-                                traces.log(self.agent_id, "error", message=str(e)[:200], status="error")
+                    # Double-check: if someone beat us to the lock, re-queue and wait
+                    if self.redis.exists("claude_code_lock"):
+                        self.redis.rpush(stream, result[1])
+                        time.sleep(3)
+                        continue
+                    _, raw = result
+                    task = json.loads(raw)
+                    try:
+                        self.handle_task(task)
+                    except Exception as e:
+                        logger.error("[%s] Task error: %s", self.agent_id, e)
+                        traces.log(self.agent_id, "error", message=str(e)[:200], status="error")
+                        try:
+                            from agentforge.core.dead_letter import dead_letter
+                            dead_letter.enqueue(task, str(e)[:300])
+                        except Exception:
+                            pass
 
                 # Periodic sub-agent status (every 30s)
                 now_ts = time.time()

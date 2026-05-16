@@ -60,6 +60,7 @@ def save_trajectory(bug_id: str, agent_name: str, method: str,
         "timestamp": datetime.now().isoformat(),
         "files_searched": files_searched or [],
         "fix_summary": fix_summary,
+        "trajectory_dir": str(run_dir),
     }
     with open(run_dir / "meta.json", "w") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -172,6 +173,8 @@ def _update_index(bug_id: str, meta: dict):
         "success": meta["success"],
         "elapsed_s": meta["elapsed_s"],
         "timestamp": meta["timestamp"],
+        "fix_summary": meta.get("fix_summary", ""),
+        "trajectory_dir": meta.get("trajectory_dir", ""),
     })
 
     # Keep last 1000 entries
