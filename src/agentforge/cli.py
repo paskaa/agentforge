@@ -11,7 +11,12 @@ Usage:
 
 import logging
 import sys
+import importlib
 from pathlib import Path
+
+# Invalidate Python import cache so file edits take effect immediately
+sys.dont_write_bytecode = True
+importlib.invalidate_caches()
 
 # Ensure project root on path
 sys.path.insert(0, str(Path(__file__).parent.parent))

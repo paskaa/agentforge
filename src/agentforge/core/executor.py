@@ -314,7 +314,10 @@ class AgentExecutor:
         
         if source in pipeline_sources and target != self.agent_id:
             # Pipeline message for wrong agent: re-push to queue
-            self.redis.rpush(self.cfg.redis_stream, json.dumps(task))
+            if self.agent_id in {"zhaoyun", "guanyu", "xunyu"}:
+                self.redis.rpush(self.cfg.redis_stream, json.dumps(task))
+            else:
+                self.redis.xadd(self.cfg.redis_stream, task)
             return
         
         if source == "coordinator_scan" and self.agent_id not in fix_agents:
@@ -435,7 +438,7 @@ class AgentExecutor:
                 continue
             # Build PM analyze message
             bug_lines = "\n".join(f"  #{b[0]}：{b[1][:60]}" for b in bugs[:10])
-            self.redis.rpush(self.cfg.redis_stream, json.dumps({
+            self.redis.xadd(self.cfg.redis_stream, {
                 "agent_id": "liubei",
                 "message": f"请分析并分派以下 {len(bugs)} 个人类 Bug（{human}）：\n{bug_lines}",
                 "source": "pm_analyze",
@@ -444,7 +447,7 @@ class AgentExecutor:
                 "is_dm": "true",
                 "msg_id": f"human-batch-{int(time.time())}",
                 "timestamp": datetime.now().isoformat(),
-            }))
+            })
             logger.info("[liubei] Injected %d bugs from %s into PM analysis", len(bugs), human)
 
     def _maybe_trigger_pipeline(self, message: str, reply: str, task: dict, redis_id: str):
@@ -574,29 +577,90 @@ class AgentExecutor:
                       "xunyu": self.cfg.redis_stream + ":fix:xunyu"}
         if self.agent_id in fix_queues:
             stream = fix_queues[self.agent_id]
+            is_fixer = True
         else:
             stream = self.cfg.redis_stream
+            is_fixer = False
         self.boot_check()
-        logger.info("[%s] Main loop started (stream=%s)", self.agent_id, stream)
+        logger.info("[%s] Main loop started (stream=%s, fixer=%s)", self.agent_id, stream, is_fixer)
+
+        # Non-fixer: create consumer group for stream
+        if not is_fixer:
+            try:
+                self.redis.xgroup_create(stream, f"{self.agent_id}-workers", id="$", mkstream=True)
+            except Exception:
+                pass  # group already exists
 
         last_status = 0
         while True:
             try:
-                # If another agent holds the Claude Code lock, wait before polling
-                if self.redis.exists("claude_code_lock"):
+                # Lock check: only fixers need it
+                if is_fixer and self.redis.exists("claude_code_lock"):
                     time.sleep(5)
                     continue
-                result = self.redis.blpop(stream, timeout=10)
+                
+                if is_fixer:
+                    result = self.redis.blpop(stream, timeout=10)
+                else:
+                    # Non-fixer: XREADGROUP — claim pending first, then new messages
+                    result = None
+                    # Step 1: Try to claim a pending message (crashed/failed previously)
+                    try:
+                        pending = self.redis.xpending_range(
+                            stream, f"{self.agent_id}-workers", "-", "+", 1
+                        )
+                        if pending:
+                            p_msg = pending[0]
+                            p_id = p_msg["message_id"] if isinstance(p_msg, dict) else p_msg[0]
+                            claimed = self.redis.xclaim(
+                                stream, f"{self.agent_id}-workers",
+                                self.agent_id, 60000, [p_id]
+                            )
+                            if claimed:
+                                msg_id, fields = claimed[0]
+                                decoded = {k.decode() if isinstance(k, bytes) else k:
+                                           v.decode() if isinstance(v, bytes) else v
+                                           for k, v in fields.items()}
+                                result = (stream, json.dumps(decoded))
+                                self._last_msg_id = msg_id
+                    except Exception:
+                        pass
+                    
+                    # Step 2: If no pending, read new messages
+                    if not result:
+                        msgs = self.redis.xreadgroup(
+                            f"{self.agent_id}-workers", f"{self.agent_id}-consumer",
+                            {stream: ">"}, count=1, block=10000
+                        )
+                        if msgs:
+                            for stream_name, entries in msgs:
+                                for msg_id, fields in entries:
+                                    decoded = {k.decode() if isinstance(k, bytes) else k:
+                                               v.decode() if isinstance(v, bytes) else v
+                                               for k, v in fields.items()}
+                                    result = (stream_name.decode() if isinstance(stream_name, bytes) else stream_name,
+                                             json.dumps(decoded))
+                                    self._last_msg_id = msg_id
+                                    break
+                                if result:
+                                    break
                 if result:
+                    logger.info("[%s] Consumed 1 message from stream", self.agent_id)
                     # Double-check: if someone beat us to the lock, re-queue and wait
                     if self.redis.exists("claude_code_lock"):
                         self.redis.rpush(stream, result[1])
                         time.sleep(3)
                         continue
-                    _, raw = result
+                    key, raw = result
                     task = json.loads(raw)
                     try:
                         self.handle_task(task)
+                        # ACK after successful processing (non-fixer stream only)
+                        if not is_fixer and self._last_msg_id:
+                            try:
+                                self.redis.xack(stream, f"{self.agent_id}-workers", self._last_msg_id)
+                            except Exception:
+                                pass
                     except Exception as e:
                         logger.error("[%s] Task error: %s", self.agent_id, e)
                         traces.log(self.agent_id, "error", message=str(e)[:200], status="error")
